@@ -1,0 +1,30 @@
+{
+  "harness-lifecycle": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "python scripts/hook_runner.py session-start",
+        "timeout": 15
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python scripts/hook_runner.py post-tool-use",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "python scripts/hook_runner.py stop",
+        "timeout": 30
+      }
+    ]
+  }
+}

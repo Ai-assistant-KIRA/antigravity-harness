@@ -1,0 +1,12 @@
+{
+  "name": "harness",
+  "displayName": "Harness² Self-Improving Agent Scaffold",
+  "description": "Recursive Agent Harnessing for Antigravity (based on Google Research Harness²). Automatically evolves AGENTS.md rules, builds reusable skills from task execution, retains memory across sessions, and eliminates cold starts.",
+  "version": "1.0.0",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "Run Harness recursive reflection on the latest session",
+    "Synthesize new skills from recent tasks and update AGENTS.md",
+    "Inspect Harness memory library and active self-improvements"
+  ]
+}

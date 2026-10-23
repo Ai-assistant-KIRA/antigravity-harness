@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="harnessGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#4285F4" />
+      <stop offset="50%" stop-color="#9C27B0" />
+      <stop offset="100%" stop-color="#00E676" />
+    </linearGradient>
+    <linearGradient id="coreGrad" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#00E5FF" />
+      <stop offset="100%" stop-color="#7C4DFF" />
+    </linearGradient>
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="6" result="blur" />
+      <feComposite in="SourceGraphic" in2="blur" operator="over" />
+    </filter>
+  </defs>
+
+  <!-- Background / Padding Shield Outline (Transparent inner) -->
+  <rect width="256" height="256" fill="none" />
+
+  <!-- Outer Recursive Loop (Harness Shield) -->
+  <g transform="translate(128, 128)">
+    <!-- Outer Hexagonal Scaffold -->
+    <polygon points="0,-95 82,-48 82,48 0,95 -82,48 -82,-48"
+             fill="none" stroke="url(#harnessGrad)" stroke-width="8" stroke-linejoin="round" opacity="0.4" />
+
+    <!-- Recursive Dynamic Feedback Arcs -->
+    <path d="M -55,-60 A 82 82 0 0 1 65,-50"
+          fill="none" stroke="url(#harnessGrad)" stroke-width="12" stroke-linecap="round" />
+    <polygon points="75,-50 60,-65 65,-40" fill="#4285F4" />
+
+    <path d="M 75,30 A 82 82 0 0 1 -30,78"
+          fill="none" stroke="url(#harnessGrad)" stroke-width="12" stroke-linecap="round" />
+    <polygon points="-40,78 -25,92 -32,68" fill="#00E676" />
+
+    <path d="M -75,20 A 82 82 0 0 1 -60,-45"
+          fill="none" stroke="url(#harnessGrad)" stroke-width="12" stroke-linecap="round" />
+    <polygon points="-60,-55 -70,-35 -50,-40" fill="#9C27B0" />
+
+    <!-- Inner Core: Nucleus & Squared Harness Matrix -->
+    <circle cx="0" cy="0" r="28" fill="url(#coreGrad)" filter="url(#glow)" />
+    <circle cx="0" cy="0" r="14" fill="#FFFFFF" />
+
+    <!-- Super-script 2 (Square) symbol representing Harness² -->
+    <path d="M 32,-32 L 44,-32 C 48,-32 50,-35 50,-38 C 50,-41 47,-44 43,-44 C 38,-44 36,-41 36,-39 M 32,-26 L 52,-26"
+          fill="none" stroke="#FFFFFF" stroke-width="3" stroke-linecap="round" />
+  </g>
+</svg>
