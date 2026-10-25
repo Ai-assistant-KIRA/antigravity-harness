@@ -299,7 +299,7 @@ class TestInstaller(IsolatedHarnessTestCase):
             (backups[-1] / "memory" / "sentinel.txt").read_text(encoding="utf-8"),
             "keep memory\n",
         )
-        self.assertIn(str(backups[-1]), output)
+        self.assertIn(backups[-1].name, output)
 
     def test_uninstall_refuses_non_harness_and_source_checkouts(self) -> None:
         unrelated = self.root / "unrelated"

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 
@@ -128,7 +129,7 @@ class SettingsIntegrationTest(IsolatedHarnessTestCase):
                 ]
             )
         report = json.loads(out.getvalue())
-        self.assertEqual(report["workspace"], str(self.workspace))
+        self.assertTrue(os.path.samefile(report["workspace"], self.workspace))
         self.assertIn("files", report)
         self.assertIn("recommendations", report)
 
