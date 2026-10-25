@@ -3,8 +3,8 @@
     "SessionStart": [
       {
         "type": "command",
-        "command": "python scripts/hook_runner.py session-start",
-        "timeout": 15
+        "command": "python -X utf8 scripts/hook_runner.py session-start",
+        "timeout": 20
       }
     ],
     "PostToolUse": [
@@ -13,17 +13,24 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python scripts/hook_runner.py post-tool-use",
-            "timeout": 10
+            "command": "python -X utf8 scripts/hook_runner.py post-tool-use",
+            "timeout": 5
           }
         ]
+      }
+    ],
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "python -X utf8 scripts/hook_runner.py pre-invocation",
+        "timeout": 5
       }
     ],
     "Stop": [
       {
         "type": "command",
-        "command": "python scripts/hook_runner.py stop",
-        "timeout": 30
+        "command": "python -X utf8 scripts/hook_runner.py stop",
+        "timeout": 90
       }
     ]
   }

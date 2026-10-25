@@ -1,0 +1,89 @@
+name: Bug report
+description: Report a reproducible problem with install, hooks, rules, skills, or memory.
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not paste transcripts, tokens, passwords, customer data, or private paths.
+        Redact logs before submitting.
+  - type: input
+    id: antigravity
+    attributes:
+      label: Antigravity version
+      description: From the app's About screen or the version file.
+      placeholder: "44.4.3"
+    validations:
+      required: true
+  - type: input
+    id: plugin
+    attributes:
+      label: Harness version
+      description: Output of `harness --version` or `harness doctor`.
+      placeholder: "2.1.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows
+        - macOS
+        - Linux
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      placeholder: "3.12.10"
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: Install method
+      options:
+        - One-prompt Antigravity install
+        - Manual git clone and install_plugin.py
+        - Upgrade from an older version
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Lines from `state/hook_errors.log` or `harness doctor`, with secrets removed.
+      render: text
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I ran `harness doctor`.
+          required: true
+        - label: I searched existing issues.
+          required: true
+        - label: I removed secrets, transcripts, and private data from this report.
+          required: true

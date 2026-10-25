@@ -1,0 +1,4 @@
+#!/usr/bin/env sh
+# Harness² CLI wrapper. Works from any working directory.
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec "${PYTHON:-python3}" "$SCRIPT_DIR/../scripts/harness_cli.py" "$@"

@@ -1,17 +1,24 @@
 <!-- HARNESS:AUTONOMOUS_RULES_START -->
-## ⚡ Harness² Evolved Directives (Global Plugin Rules)
-> *These rules are autonomously maintained by the Harness² self-improvement engine.
-> They record verified platform heuristics, failure preventions, and standing directives.*
+## Harness Evolved Directives (Global Environment)
+> Maintained automatically by Harness². User content outside this block is preserved.
+> Verified failure/recovery lessons only; no transcript timestamps or exit-code noise.
 
 ### Standing Project Directives
-- Always leverage previously synthesized skills from the Harness library before executing multi-step procedures from scratch.
-- When encountering novel failures, note the error pattern and verified recovery so the Stop hook can synthesize a contrastive invariant.
+- Use existing learned skills before re-deriving a known multi-step procedure.
+- Use the harness CLI (`bin/harness.cmd` on Windows, `bin/harness` elsewhere) to inspect memory and validate skills.
+- Keep the Harness-managed `AGENTS.md` block below 20 KB; Antigravity caps each rules file at 24 KB.
+- Never persist credentials, tokens, private keys, or connection strings in rules, skills, or memory exports.
 
 ### Environment & Tooling Quirks
-- **PowerShell / Windows**: When executing commands with quotes or pipes, escape properly or write complex multi-line logic to scratch scripts to avoid shell truncation.
-- **Python Runtime**: Use `python -m <module>` or virtual environment executables rather than relying on unaliased global scripts.
+- PowerShell: quote paths containing spaces and avoid multi-line inline commands; write complex logic to a temporary script.
+- Python on Windows: run with `-X utf8` when output contains non-ASCII, and prefer `python -m module` over bare entry points.
+- Antigravity hooks run with the plugin directory as the working directory; resolve project paths from the hook payload instead of the process cwd.
+- When a command fails, capture the full stderr and the first actionable error line; an exit code alone is not a diagnosis.
 
 ### Learned Pitfalls & Recovery Invariants
-- **File Encoding**: Always read and write files using UTF-8 encoding to prevent Windows cp1252 corruption.
-- **Rules Budget Guard**: Keep AGENTS.md rules concise and high-density, staying well within Antigravity's 20,000-token rules budget and 24KB per-file cap.
+- Write and read text files as UTF-8 to avoid cp1252 corruption on Windows.
+- Do not copy project-specific commands or paths into the global rules file; put them in the workspace rules instead.
+- Only promote a lesson after observing a successful recovery; unresolved failures remain candidates.
+- Before overwriting a skill, check whether it is manually authored; Harness must never replace user content.
+
 <!-- HARNESS:AUTONOMOUS_RULES_END -->

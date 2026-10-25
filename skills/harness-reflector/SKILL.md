@@ -1,40 +1,72 @@
 ---
 name: harness-reflector
 description: >-
-  Use when conducting deep reflection on a complex task or when the user asks to
-  "learn from this task", "save this workflow as a skill", or "update agents.md with lessons".
+  Use when the user asks to "learn from this task", "save this workflow as a
+  skill", "update AGENTS.md with lessons", or reflect on a completed debugging
+  or implementation session. Produces verified, scoped rules and reusable
+  skills instead of speculative advice.
 ---
 
-# Harness² Deep Task Reflector
+# Harness² Deep Reflector
 
-This skill provides an interactive, structured protocol for deep recursive reflection (Harness² Task-Level & Harnessing-Level Recursion).
+Run this protocol after a substantial task when the user asks for deliberate
+reflection, or when the automatic Stop cycle did not capture something valuable.
 
-## Reflection Protocol
+## 1. Gather evidence
 
-When completing a challenging task, follow these steps to cement learnings:
+- What was the user's actual goal?
+- Which commands, edits, or tool calls changed the outcome?
+- What failed? Include the exact error, not a paraphrase.
+- What fixed it? Only count a fix that was followed by a successful command,
+  passing test, or otherwise observable verification.
+- Was the failure transient (timeout, rate limit, flaky network)? If so, do not
+  turn it into a permanent rule.
 
-### Step 1: Identify Friction & Invariants
-- What errors or friction occurred during execution? (e.g. command syntax, OS quirks, missing packages)
-- What was the verified fix?
-- Formulate a concise rule: `When doing X, avoid Y because Z; instead use W.`
+## 2. Write bounded lessons
 
-### Step 2: Formulate Procedural Skill
-If this procedure is likely to be repeated:
-1. Define a clear, kebab-case skill identifier (e.g., `setup-fastapi-uv`, `docker-compose-deploy`).
-2. Draft a step-by-step recipe with copy-pasteable commands and verified options.
-3. List pitfalls and the exact fixes verified in this session.
+Good rule shape:
 
-### Step 3: Trigger Autonomous Registration
-Run the harness reflect command or use Python to register the findings:
+> `pytest` failed with `ModuleNotFoundError: No module named 'pytest'`.
+> Verified fix: run `python -m pip install pytest` in the active environment.
+
+Bad rule shape:
+
+> Command failed. Try again or adjust parameters.
+
+Reject rules containing timestamps, UUIDs, exit codes alone, truncated output,
+or no actionable recovery.
+
+## 3. Decide scope
+
+- **Workspace**: project commands, paths, package manager, migrations, tests,
+  local conventions. Write to the workspace `AGENTS.md`.
+- **Global**: cross-project environment quirks such as PowerShell quoting,
+  Python UTF-8 behavior, or hook cwd. Never copy project paths or commands into
+  the global file.
+- **Skill**: a repeatable multi-step procedure, not a single command and not a
+  one-off incident. Require at least three meaningful steps, or two steps plus a
+  verification step.
+
+## 4. Register through Harness
 
 ```powershell
-python -m harness reflect --workspace
-python -m harness sync
+# Re-analyse the current session and update workspace rules/skills
+bin\harness.cmd reflect --workspace . --force
+
+# Inspect what was learned
+bin\harness.cmd status
+bin\harness.cmd skills
+bin\harness.cmd rules show --target workspace
 ```
 
-### Step 4: Verify
-Verify that the new skill is discovered:
-```powershell
-python -m harness skills
-```
-Once registered, Antigravity will automatically load this skill in the relevant next sessions!
+If the transcript is not available, create a skill with `skills install` from a
+local folder, or add a concise directive to `AGENTS.md` manually. Never invent
+a verified recovery.
+
+## 5. Verify
+
+- `bin\harness.cmd skills validate`
+- `bin\harness.cmd rules sanitize --dry-run`
+- Confirm the rule/skill contains no credentials or project-irrelevant noise.
+- Confirm the managed block stays under the 20 KB budget and the file stays
+  under Antigravity's 24 KB cap.

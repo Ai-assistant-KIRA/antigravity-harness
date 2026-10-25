@@ -1,11 +1,13 @@
 """
-Harness²: Recursive Agent Harnessing for Antigravity.
-Based on Google Research Harness² (arXiv:2610.14224).
+Harness²: recursive agent harnessing for Antigravity.
 
-Implements recursive self-improvement around model execution by continuously evolving:
-- AGENTS.md rules (guardrails & conventions)
-- Skills library (reusable multi-step procedures with progressive disclosure)
-- Cross-session memory and experience library
+The plugin turns verified session evidence into:
+
+* scoped ``AGENTS.md`` rules;
+* reusable Antigravity skills with progressive disclosure;
+* a searchable SQLite memory and a human-readable EXPERIENCE.md library.
 """
 
-__version__ = "1.0.0"
+__version__ = "2.1.0"
+
+__all__ = ["__version__"]

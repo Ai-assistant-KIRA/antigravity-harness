@@ -4,19 +4,52 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "antigravity-harness"
-version = "1.0.0"
-description = "Harness²: Recursive Agent Harnessing for Antigravity (Google Research Harness² adaptation)"
+version = "2.1.0"
+description = "A self-improving harness plugin for Antigravity."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
 authors = [
-    { name = "Antigravity Team & Harness Community" }
+    { name = "Reda Alaarabi" }
+]
+keywords = [
+    "antigravity",
+    "antigravity-plugin",
+    "ai-agents",
+    "agent-harness",
+    "self-improving",
+    "agent-skills",
+    "memory",
+    "sqlite",
 ]
 dependencies = []
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Quality Assurance",
+    "Topic :: Software Development :: Testing",
+]
 
 [project.scripts]
 harness = "harness.cli:main"
 
+[project.urls]
+Homepage = "https://github.com/Ai-assistant-KIRA/antigravity-harness"
+Repository = "https://github.com/Ai-assistant-KIRA/antigravity-harness"
+Issues = "https://github.com/Ai-assistant-KIRA/antigravity-harness/issues"
+Changelog = "https://github.com/Ai-assistant-KIRA/antigravity-harness/blob/main/CHANGELOG.md"
+
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["harness*", "plugin*"]
+include = ["harness*"]
+
+[tool.setuptools.package-data]
+harness = ["py.typed"]

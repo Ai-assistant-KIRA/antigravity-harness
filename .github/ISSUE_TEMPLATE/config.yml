@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Installation and troubleshooting
+    url: https://github.com/Ai-assistant-KIRA/antigravity-harness/blob/main/INSTALL.md
+    about: Read the install, upgrade, rollback, and troubleshooting guide.
+  - name: Security report
+    url: https://github.com/Ai-assistant-KIRA/antigravity-harness/security/policy
+    about: Report a vulnerability privately. Do not open a public issue.
+  - name: Support
+    url: https://github.com/Ai-assistant-KIRA/antigravity-harness/blob/main/SUPPORT.md
+    about: Learn what to include in a bug report or usage question.

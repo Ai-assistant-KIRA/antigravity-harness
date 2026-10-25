@@ -35,9 +35,26 @@ ENV/
 env.bak/
 venv.bak/
 
-# SQLite / databases
+# Local agent instructions (generated during development)
+/AGENTS.md
+
+# SQLite, runtime state, and generated experience data
 *.db
+*.db-wal
+*.db-shm
 *.sqlite3
+memory/
+state/
+.harness-backups/
+.harness-export.json
+
+# Coverage / caches
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # OS generated
 .DS_Store
