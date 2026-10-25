@@ -96,9 +96,9 @@ python install_plugin.py --rollback
 
 ## Is it production-ready?
 
-It is a beta. The code is tested, the install is reversible, and the plugin fails
-open. The analyzer is heuristic and learned text is untrusted. Review rules and
-skills before relying on them in a sensitive environment.
+Yes, for local development use. The code is tested, the install is reversible, and
+the plugin fails open. The analyzer is heuristic and learned text is untrusted, so
+review rules and skills before relying on them in a sensitive environment.
 
 ## How do I contribute?
 
