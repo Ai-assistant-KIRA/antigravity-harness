@@ -29,6 +29,7 @@ from .core.config import (
 from .core.engine import HarnessEngine
 from .core.memory_store import MemoryStore
 from .core.retrieval import find_recall, format_recall_message
+from .core.router import TaskRouter
 from .core.settings import get_setting, load_settings
 from .core.skill_builder import SkillBuilder, SkillError
 from .core.trust import audit_privacy
@@ -293,6 +294,14 @@ def cmd_reflect(args: argparse.Namespace) -> None:
             print(f"  skipped      : {item['name']} ({item['reason']})")
     if result.skill_reuse:
         print(f"  skills reused: {', '.join(result.skill_reuse)}")
+    if result.routing:
+        routed_skills = result.routing.get("skills") or []
+        routed_tools = result.routing.get("tools") or []
+        print(
+            "  routing      : "
+            f"{len(routed_skills)} skill(s), {len(routed_tools)} tool(s) "
+            f"-> {result.routing.get('path')}"
+        )
     for warning in result.warnings:
         print(f"  warning      : {warning}")
     if result.status == "no_transcript":
@@ -1141,6 +1150,50 @@ def cmd_recall(args: argparse.Namespace) -> None:
     print(message)
 
 
+# ------------------------------------------------------------------------ route
+def cmd_route(args: argparse.Namespace) -> None:
+    """Detect and persist the project-local skills/tools for a task."""
+    workspace = _workspace(args) or Path.cwd().resolve()
+    task = " ".join(args.query).strip()
+    router = TaskRouter(workspace)
+    if not router.enabled:
+        message = "Task routing is disabled (routing.enabled = false)."
+        if args.json:
+            _echo({"enabled": False, "workspace": str(workspace), "message": message}, True)
+        else:
+            print(message, file=sys.stderr)
+        return
+    result = router.apply(task, dry_run=args.dry_run)
+    payload = {
+        "workspace": str(workspace),
+        **result.as_dict(),
+        "dry_run": bool(args.dry_run),
+    }
+    if args.json:
+        _echo(payload, True)
+        return
+    print(f"[HARNESS] Task routing for {workspace}")
+    if payload["task"]:
+        print(f"  task    : {payload['task']}")
+    print(
+        "  skills  : "
+        + (", ".join(payload["skills"]) if payload["skills"] else "none matched")
+    )
+    print(
+        "  tools   : "
+        + (", ".join(payload["tools"]) if payload["tools"] else "none matched")
+    )
+    if payload["inventory"]:
+        print("  available project skills: " + ", ".join(payload["inventory"]))
+    print(
+        f"  agents  : {payload['path']} "
+        f"({'updated' if payload['updated'] else 'unchanged'}"
+        f"{', dry run' if args.dry_run else ''})"
+    )
+    for warning in payload["warnings"]:
+        print(f"  warning : {warning}")
+
+
 # ----------------------------------------------------------------------- privacy
 def cmd_privacy(args: argparse.Namespace) -> None:
     workspace = _workspace(args) or Path.cwd().resolve()
@@ -1331,6 +1384,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_recall.add_argument("--json", action="store_true")
     _add_workspace(p_recall)
     p_recall.set_defaults(func=cmd_recall)
+
+    p_route = subparsers.add_parser(
+        "route",
+        help="detect project-local skills/tools for a task and write them to AGENTS.md",
+    )
+    p_route.add_argument(
+        "query",
+        nargs="*",
+        help="task text; omit to refresh the project skill inventory",
+    )
+    p_route.add_argument("--dry-run", action="store_true", help="show the selection without writing")
+    p_route.add_argument("--json", action="store_true")
+    _add_workspace(p_route)
+    p_route.set_defaults(func=cmd_route)
 
     p_privacy = subparsers.add_parser(
         "privacy", help="audit stored state, memory, and learned artifacts"

@@ -16,6 +16,13 @@ EXPECTED_DEFAULTS = {
     "skills": {"max_per_session": 2, "min_quality": 0.55},
     "memory": {"prune_days": 365, "candidate_days": 30, "max_lessons": 2000},
     "hooks": {"stop_timeout": 90, "post_tool_use_timeout": 5},
+    "project": {"isolate_memory": True, "project_skills_only": True},
+    "routing": {
+        "enabled": True,
+        "auto_apply": True,
+        "max_skills": 5,
+        "max_tools": 6,
+    },
 }
 
 TOML_AVAILABLE = harness_settings._tomllib is not None
@@ -133,6 +140,23 @@ class TestSettings(unittest.TestCase):
         self.assertEqual(warnings, [])
         self.assertEqual(settings["skills"]["min_quality"], 1.0)
         self.assertIsInstance(settings["skills"]["min_quality"], float)
+
+    def test_boolean_settings_accept_only_booleans(self) -> None:
+        self.write_json(
+            {
+                "project": {"isolate_memory": False, "project_skills_only": "yes"},
+                "routing": {"enabled": 0, "auto_apply": True, "max_skills": 2},
+            }
+        )
+        settings, warnings = harness_settings.load_settings(self.root)
+        self.assertFalse(settings["project"]["isolate_memory"])
+        self.assertTrue(settings["project"]["project_skills_only"])
+        self.assertTrue(settings["routing"]["enabled"])
+        self.assertTrue(settings["routing"]["auto_apply"])
+        self.assertEqual(settings["routing"]["max_skills"], 2)
+        text = "\n".join(warnings)
+        self.assertIn("project.project_skills_only", text)
+        self.assertIn("routing.enabled", text)
 
     def test_wrong_section_type_warns_and_keeps_section_defaults(self) -> None:
         self.write_json(

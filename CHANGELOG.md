@@ -2,6 +2,40 @@
 
 All notable changes to Harness² are documented here.
 
+## Unreleased
+
+### Added
+
+- Project-aware task routing. Every new prompt, every completed `Stop` cycle, and
+  `harness route "task"` select the project-local skills and tools that match the
+  work and write them into the managed `### Task Routing (auto-selected)` section
+  of that project's `AGENTS.md`. The section is replaced per task, never
+  accumulated, and preserves all user text outside the managed block.
+- Routing is deterministic and offline: lexical overlap plus project signals,
+  generated-skill quality, and evidence of reuse. No model call is made.
+- `.agents/tools.json` lets a project declare its own tool vocabulary; when
+  present it replaces the built-in catalog.
+- Project memory isolation: each workspace gets
+  `<plugin>/memory/projects/<fingerprint>/harness_memory.db` and `EXPERIENCE.md`.
+  A new project database is seeded once with pre-existing global environment
+  lessons; another project's lessons are never imported.
+- `harness route` and routing output in `harness reflect`.
+
+### Changed
+
+- Lesson ids are allocated from a shared monotonic counter, so
+  `harness memory show <id>` cannot resolve to a different lesson in another
+  project now that stores are physically separate.
+- `harness memory search/list --all-projects` unions every project database and
+  the global store instead of only scanning one database.
+- Skill discovery is project-local by default; global and other-project skills
+  are not routed into a workspace.
+
+### Configuration
+
+- New settings default to on: `[project] isolate_memory`, `project_skills_only`,
+  and `[routing] enabled`, `auto_apply`, `max_skills`, `max_tools`.
+
 ## 2.1.0 — 2026-10-25
 
 First public release.

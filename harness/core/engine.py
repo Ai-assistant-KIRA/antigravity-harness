@@ -32,6 +32,7 @@ from .config import (
 from .incremental import IncrementalRead, read_incremental
 from .memory_store import MemoryStore
 from .redaction import redact
+from .router import TaskRouter
 from .settings import get_setting, load_settings
 from .skill_builder import (
     SkillBuildResult,
@@ -73,6 +74,7 @@ class EngineResult:
     skill_reuse: list[str] = field(default_factory=list)
     memory_logged: bool = False
     memory_counts: dict[str, int] = field(default_factory=dict)
+    routing: dict[str, Any] = field(default_factory=dict)
     transcript_hash: str = ""
     warnings: list[str] = field(default_factory=list)
     summary: str = ""
@@ -368,7 +370,28 @@ class HarnessEngine:
 
         result.skill_reuse = list(analysis.skill_usage)
 
-        # 3. Memory. This is also where unverified observations are retained.
+        # 3. Task routing. New rules and generated skills must be reachable from
+        # this project's AGENTS.md, otherwise the next session cannot load them.
+        if workspace and get_setting(self.settings, "routing.enabled", True):
+            router = TaskRouter(workspace)
+            # Do not create an AGENTS.md just to record that nothing was learned.
+            worth_writing = bool(
+                result.rules_updated
+                or result.skills_synthesized
+                or result.skills_updated
+                or router.project_skills()
+                or (Path(workspace) / "AGENTS.md").exists()
+            )
+            if worth_writing:
+                try:
+                    task_text = "; ".join(analysis.tasks)[:200] or "Interactive session"
+                    routed = router.apply(task_text)
+                    result.routing = routed.as_dict()
+                    result.warnings.extend(result.routing.get("warnings", []))
+                except Exception as exc:
+                    self._add_warning(result, f"task routing failed: {exc}")
+
+        # 4. Memory. This is also where unverified observations are retained.
         try:
             counts = self.memory_store.record_session(
                 analysis,

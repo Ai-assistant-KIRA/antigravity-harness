@@ -24,9 +24,15 @@ import time
 from pathlib import Path
 from typing import Any, Iterable
 
-from .config import get_state_dir, safe_conversation_id, tokenize
+from .config import (
+    get_state_dir,
+    project_skills_only,
+    safe_conversation_id,
+    tokenize,
+)
 from .memory_store import MemoryStore
 from .redaction import redact
+from .router import TaskRouter
 from .skill_builder import SkillBuilder
 from .util import atomic_write_text, file_lock, one_line, sha256_text, truncate
 
@@ -236,11 +242,15 @@ def find_recall(
     skills: list[dict[str, Any]] = []
     if include_skills:
         try:
-            installed = SkillBuilder(workspace).list_installed_skills(workspace)
+            installed = SkillBuilder(workspace).list_installed_skills(
+                workspace, include_global=not project_skills_only()
+            )
         except Exception:
             installed = []
         for skill in installed:
             if not skill.get("valid", True):
+                continue
+            if project_skills_only() and skill.get("scope") != "workspace":
                 continue
             text = f"{skill.get('name', '')} {skill.get('description', '')}"
             overlap = len(query_tokens & _tokens(text))
@@ -266,10 +276,11 @@ def find_recall(
 def format_recall_message(
     lessons: Iterable[dict[str, Any]],
     skills: Iterable[dict[str, Any]],
+    routing: str = "",
 ) -> str:
     lesson_rows = list(lessons)[:MAX_LESSONS]
     skill_rows = list(skills)[:MAX_SKILLS]
-    if not lesson_rows and not skill_rows:
+    if not lesson_rows and not skill_rows and not routing:
         return ""
     lines = ["⚡ Harness² recall for the current request:"]
     for lesson in lesson_rows:
@@ -289,6 +300,8 @@ def format_recall_message(
         description = one_line(skill.get("description") or "", 180)
         if name:
             lines.append(f"- Skill `{name}`: {description}")
+    if routing:
+        lines.append(f"- {one_line(routing, 320)}")
     lines.append("Use only what matches the current task; verify before acting.")
     return truncate("\n".join(lines), MAX_MESSAGE_CHARS)
 
@@ -435,7 +448,31 @@ def build_pre_invocation_payload(
     )
     lessons = lessons[:MAX_LESSONS]
     skills = skills[:MAX_SKILLS]
-    message = format_recall_message(lessons, skills)
+
+    # Task-shaped routing: detect the project-local skills and tools this
+    # request needs and persist them in the workspace AGENTS.md managed block.
+    routing_line = ""
+    route_signature = ""
+    if allow_prompt and prompt and workspace:
+        try:
+            router = TaskRouter(workspace)
+            if router.should_auto_apply():
+                routed = router.apply(prompt)
+                routing_line = routed.selection.summary()
+                if routing_line:
+                    route_signature = "route:" + sha256_text(
+                        routing_line + "|" + "|".join(
+                            [str(item.get("name")) for item in routed.selection.skills]
+                            + [str(item.get("name")) for item in routed.selection.tools]
+                        )
+                    )[:16]
+                    signature_parts.append(route_signature)
+        except Exception:
+            # Routing is an enhancement; recall must still work without it.
+            routing_line = ""
+            route_signature = ""
+
+    message = format_recall_message(lessons, skills, routing_line)
     if not message:
         _commit_state(
             state_path,

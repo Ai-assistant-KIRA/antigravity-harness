@@ -77,6 +77,21 @@ Everything outside the block is preserved. The managed block is capped at 20 KB
 of actual encoded bytes, including CRLF expansion and UTF-16, so the file stays
 under Antigravity's 24 KB per-file limit.
 
+### Task routing
+
+The workspace block also carries a `### Task Routing (auto-selected)` section.
+On each new prompt (`PreInvocation`), after every processed `Stop` cycle, and on
+`harness route`, the router picks the project-local skills and tools that match
+the task and replaces that section. It is a single current selection, not a log:
+a stale selection would tell the agent to load the wrong skills.
+
+Ranking is lexical overlap with the task and detected project signals, plus
+generated-skill quality and reuse. Only skills under
+`<workspace>/.agents/skills` are eligible, and the task text is redacted and
+injection-scanned before it is written. Tools come from a built-in catalog;
+`.agents/tools.json` replaces it for projects that declare their own vocabulary.
+No model is called.
+
 ## Skills
 
 A skill is much more expensive than a rule: it consumes context and can change
@@ -105,6 +120,17 @@ SQLite is the source of truth:
 The database stores lessons, candidates, rule provenance, skill metadata, and
 surfacing counters. `EXPERIENCE.md` is generated from the database and should
 never be edited by hand.
+
+Stores are isolated per project by default:
+
+- global knowledge lives in `<plugin>/memory/harness_memory.db`;
+- each project gets `<plugin>/memory/projects/<fingerprint>/harness_memory.db`
+  and its own `EXPERIENCE.md`, outside the user's repository;
+- a new project database is seeded once with pre-existing global *environment*
+  lessons, never with another project's lessons;
+- lesson ids come from a shared monotonic counter, so ids stay unambiguous across
+  databases (`harness memory show <id>`);
+- `--all-projects` queries union every project database with the global store.
 
 Retrieval is outcome-aware. Lessons and skills track how often they were
 surfaced. If the same failure recurs after a lesson was shown, that lesson's

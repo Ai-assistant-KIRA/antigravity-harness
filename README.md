@@ -103,9 +103,9 @@ flowchart LR
 | Event | What happens |
 | :--- | :--- |
 | `SessionStart` | Injects relevant skills, verified lessons, and rule sizes. |
-| `PreInvocation` | Finds a matching lesson for the newest prompt or tool error. |
+| `PreInvocation` | Matches the newest prompt, then routes project-local skills and tools into `AGENTS.md`. |
 | `PostToolUse` | Records a redacted failure journal for diagnostics. Never blocks. |
-| `Stop` | Analyses the transcript, promotes verified recoveries, and updates memory. |
+| `Stop` | Analyses the transcript, promotes verified recoveries, and refreshes routing and memory. |
 
 A simple example:
 
@@ -119,13 +119,48 @@ A simple example:
 | Output | Location | Boundary |
 | :--- | :--- | :--- |
 | Workspace rules | `<workspace>/AGENTS.md` | Only the Harness-managed block |
+| Task routing | `<workspace>/AGENTS.md` (`### Task Routing`) | Replaced per task; project skills and tools only |
 | Global rules | `<plugin>/rules/AGENTS.md` | Environment and tooling only |
 | Skills | `<workspace>/.agents/skills/<name>/SKILL.md` | Manual skills are never overwritten |
-| Memory | `<plugin>/memory/harness_memory.db` | Local SQLite with FTS5 |
+| Tool declarations | `<workspace>/.agents/tools.json` | Optional; replaces the built-in tool catalog |
+| Memory | `<plugin>/memory/harness_memory.db` | Global knowledge only |
+| Project memory | `<plugin>/memory/projects/<fingerprint>/harness_memory.db` | Isolated per project; seeded once from global environment lessons |
 | Experience log | `<plugin>/memory/EXPERIENCE.md` | Generated; do not edit by hand |
+| Project experience | `<plugin>/memory/projects/<fingerprint>/EXPERIENCE.md` | Generated per project |
 
 The managed rule block is capped at 20 KB so it stays below Antigravity's 24 KB
 per-file limit. Files outside the block are left alone.
+
+## Project-aware routing
+
+Every new prompt is routed to the skills and tools that match it, without a model
+call. The selection is written to the managed `### Task Routing (auto-selected)`
+section of that project's `AGENTS.md`, so Antigravity loads only what is listed
+there. Routing is replaced on the next task instead of accumulating.
+
+- Only skills that physically live in `<workspace>/.agents/skills` are eligible;
+  global and other-project skills are never routed into a project.
+- Skills generated from repeated sessions become eligible automatically and are
+  listed in the project skill inventory even when they do not match the current
+  task.
+- Tools come from a built-in catalog. A project can own the vocabulary with
+  `.agents/tools.json`:
+
+```json
+{
+  "tools": [
+    {
+      "name": "project_runner",
+      "description": "Run this project's test matrix.",
+      "signals": ["pytest", "tests", "ci"]
+    }
+  ]
+}
+```
+
+- Memory is isolated per project. A new project database is seeded once with
+  pre-existing global environment lessons; lessons from another project are
+  never imported.
 
 ## Safety and privacy
 
@@ -153,6 +188,7 @@ macOS/Linux use `bin/harness`.
 | `harness status --effectiveness` | Rank lessons and skills by use and recurrence |
 | `harness reflect` | Analyse a transcript and run the full cycle |
 | `harness recall "error text"` | Search verified lessons and matching skills |
+| `harness route "task text"` | Route project skills and tools into this project's `AGENTS.md` |
 | `harness memory search "pytest"` | Search stored lessons |
 | `harness skills list` | Inspect the learned skill library |
 | `harness rules why "rule text"` | Show evidence and provenance for a rule |
@@ -182,6 +218,16 @@ min_quality = 0.55
 prune_days = 365
 candidate_days = 30
 max_lessons = 2000
+
+[project]
+isolate_memory = true
+project_skills_only = true
+
+[routing]
+enabled = true
+auto_apply = true
+max_skills = 5
+max_tools = 6
 
 [hooks]
 stop_timeout = 90

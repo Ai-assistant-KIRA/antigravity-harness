@@ -10,10 +10,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Iterable
 
+from .agents_md_manager import AgentsMdManager
 from .config import (
     detect_project_signals,
     get_plugin_rules_path,
     get_workspace_rules_path,
+    project_skills_only,
 )
 from .memory_store import MemoryStore
 from .settings import get_setting, load_settings
@@ -88,6 +90,14 @@ class SessionLoader:
             if rules_path.exists():
                 size = rules_path.stat().st_size
                 lines.append(f"**Workspace rules**: `{rules_path.name}` ({size} bytes)")
+            routing = AgentsMdManager(workspace_path).routing("workspace")
+            if routing:
+                selected = [item for item in routing if not item.lower().startswith("task:")]
+                if selected:
+                    lines.append(
+                        "**Task routing (AGENTS.md)**: "
+                        + "; ".join(one_line(item, 140) for item in selected[:3])
+                    )
             lines.append("")
 
         if shown_skills:
@@ -201,7 +211,9 @@ class SessionLoader:
         workspace: Path | None,
         signals: Iterable[str],
     ) -> list[dict[str, Any]]:
-        installed = self.skill_builder.list_installed_skills(workspace)
+        installed = self.skill_builder.list_installed_skills(
+            workspace, include_global=not project_skills_only()
+        )
         by_name: dict[str, list[dict[str, Any]]] = {}
         for record in self.memory_store.get_all_skills(
             workspace, include_global=True
@@ -210,6 +222,8 @@ class SessionLoader:
 
         skills: list[dict[str, Any]] = []
         for skill in installed:
+            if project_skills_only() and skill.get("scope") != "workspace":
+                continue
             enriched = dict(skill)
             record = MemoryStore._pick_skill_candidate(
                 by_name.get(str(skill.get("name") or ""), []),

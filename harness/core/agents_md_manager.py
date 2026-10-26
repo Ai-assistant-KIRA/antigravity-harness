@@ -51,6 +51,8 @@ ANTIGRAVITY_RULE_CAP = 24 * 1024
 SECTION_DIRECTIVES = "Standing Project Directives"
 SECTION_QUIRKS = "Environment & Tooling Quirks"
 SECTION_PITFALLS = "Learned Pitfalls & Recovery Invariants"
+SECTION_ROUTING = "Task Routing"
+MAX_ROUTING_ITEMS = 16
 
 _NOISE_PATTERNS = (
     re.compile(r"\b\d{4}-\d{2}-\d{2}[t ]\d{2}:\d{2}", re.IGNORECASE),
@@ -327,18 +329,20 @@ class RuleSet:
     directives: list[str] = field(default_factory=list)
     quirks: list[str] = field(default_factory=list)
     pitfalls: list[str] = field(default_factory=list)
+    routing: list[str] = field(default_factory=list)
 
     def __bool__(self) -> bool:
-        return bool(self.directives or self.quirks or self.pitfalls)
+        return bool(self.directives or self.quirks or self.pitfalls or self.routing)
 
     def all(self) -> list[str]:
-        return [*self.directives, *self.quirks, *self.pitfalls]
+        return [*self.directives, *self.quirks, *self.pitfalls, *self.routing]
 
     def compact(self) -> "RuleSet":
         return RuleSet(
             directives=_dedupe(self.directives),
             quirks=_dedupe(self.quirks),
             pitfalls=_dedupe(self.pitfalls),
+            routing=_dedupe(self.routing),
         )
 
 
@@ -526,6 +530,29 @@ def _conflicts_in_rules(rules: Sequence[dict[str, Any]]) -> list[dict[str, Any]]
     return conflicts
 
 
+def _clean_routing_item(text: str) -> str | None:
+    """Keep a routing line readable and safe to persist in AGENTS.md.
+
+    Routing entries are not rules: they contain file names, skill names, and a
+    short task summary, so the stricter rule sanitizer would discard them. They
+    still must never inject managed-block markers, credentials, or newlines.
+    """
+    if not isinstance(text, str):
+        return None
+    clean = one_line(text.strip(), 300)
+    if not clean:
+        return None
+    if "\ufffd" in clean or "�" in clean:
+        return None
+    if "<!-- HARNESS:" in clean or "HARNESS:AUTONOMOUS_RULES" in clean:
+        return None
+    if contains_secret(clean):
+        return None
+    if clean.startswith(("- ", "* ", "+ ")):
+        clean = clean[2:].strip()
+    return redact(clean)
+
+
 def sanitize_rule(text: str, global_scope: bool = False) -> str | None:
     """Return a clean, actionable one-line rule, or ``None`` when noisy."""
     if not isinstance(text, str):
@@ -668,6 +695,7 @@ class AgentsMdManager:
             rules.directives.extend(parsed.directives)
             rules.quirks.extend(parsed.quirks)
             rules.pitfalls.extend(parsed.pitfalls)
+            rules.routing.extend(parsed.routing)
         return rules.compact()
 
     def managed_rules(self, target: str = "workspace") -> list[dict[str, Any]]:
@@ -699,6 +727,98 @@ class AgentsMdManager:
     def find_conflicts(self, target: str = "workspace") -> list[dict[str, Any]]:
         """Return clear conflicts among the rules in one managed block."""
         return _conflicts_in_rules(self.managed_rules(target))
+
+    def routing(self, target: str = "workspace") -> list[str]:
+        """Return the auto-selected skill/tool routing currently in the block."""
+        path = self._target_path(target)
+        if not path.exists():
+            return []
+        try:
+            text, _, _ = read_text_lossless(path)
+        except (OSError, UnicodeError):
+            return []
+        _, blocks = self._split_content(text)
+        items = RuleSet()
+        for block in blocks:
+            parsed = self._parse_section(block, global_scope=target != "workspace")
+            items.routing.extend(parsed.routing)
+        return [item for item in _dedupe(items.routing)][:MAX_ROUTING_ITEMS]
+
+    def set_routing(
+        self,
+        task_summary: str,
+        items: Sequence[str],
+        target: str = "workspace",
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Replace the managed routing section, preserving everything else.
+
+        Routing is task-shaped, so it is replaced rather than accumulated. A
+        stale ``Task Routing`` block would tell the agent to load skills that
+        no longer match the work in front of it.
+        """
+        path = self._target_path(target)
+        result: dict[str, Any] = {
+            "updated": False,
+            "path": str(path),
+            "items": 0,
+            "task": one_line(task_summary, 160),
+            "bytes": path.stat().st_size if path.exists() else 0,
+            "warnings": [],
+        }
+        cleaned: list[str] = []
+        task_line = _clean_routing_item(f"Task: {task_summary}") if task_summary else ""
+        if task_line:
+            cleaned.append(task_line)
+        for item in items or ():
+            value = _clean_routing_item(item)
+            if value:
+                cleaned.append(value)
+        cleaned = _dedupe(cleaned)[:MAX_ROUTING_ITEMS]
+        if not cleaned and not path.exists():
+            return result
+
+        original = ""
+        encoding = "utf-8"
+        newline = "\n"
+        if path.exists():
+            try:
+                original, encoding, newline = read_text_lossless(path)
+            except (OSError, UnicodeError) as exc:
+                result["warnings"].append(
+                    f"not modified: unreadable or non-UTF-8 file ({exc})"
+                )
+                return result
+
+        user_content, blocks = self._split_content(original)
+        existing = RuleSet()
+        for block in blocks:
+            parsed = self._parse_section(block, global_scope=target != "workspace")
+            existing.directives.extend(parsed.directives)
+            existing.quirks.extend(parsed.quirks)
+            existing.pitfalls.extend(parsed.pitfalls)
+            existing.routing.extend(parsed.routing)
+        existing = existing.compact()
+        existing.routing = cleaned
+        final, fitted, warnings = self._render_with_budget(
+            user_content,
+            existing,
+            target == "workspace",
+            newline=newline,
+            encoding=encoding,
+        )
+        result["warnings"].extend(warnings)
+        changed = self._normalize_file(final) != self._normalize_file(original)
+        if changed and not dry_run:
+            atomic_write_text(path, final, encoding=encoding, newline=newline)
+        result.update(
+            {
+                "updated": changed,
+                "items": len(fitted.routing),
+                "bytes": self._encoded_size(final, newline, encoding),
+            }
+        )
+        return result
 
     def remove_rule(
         self,
@@ -732,10 +852,12 @@ class AgentsMdManager:
             parsed.directives.extend(block_rules.directives)
             parsed.quirks.extend(block_rules.quirks)
             parsed.pitfalls.extend(block_rules.pitfalls)
+            parsed.routing.extend(block_rules.routing)
         cleaned = RuleSet(
             directives=_dedupe(parsed.directives),
             quirks=_dedupe(parsed.quirks),
             pitfalls=_dedupe(parsed.pitfalls),
+            routing=_dedupe(parsed.routing),
         )
 
         wanted = normalize_for_compare(text, keep_code=True)
@@ -883,6 +1005,7 @@ class AgentsMdManager:
             existing.directives.extend(parsed.directives)
             existing.quirks.extend(parsed.quirks)
             existing.pitfalls.extend(parsed.pitfalls)
+            existing.routing.extend(parsed.routing)
         existing = existing.compact()
         previously_managed = existing.compact()
 
@@ -916,6 +1039,7 @@ class AgentsMdManager:
             directives=self._merge(existing.directives, new_rules.directives, user_rules),
             quirks=self._merge(existing.quirks, new_rules.quirks, user_rules),
             pitfalls=self._merge(existing.pitfalls, new_rules.pitfalls, user_rules),
+            routing=self._merge(existing.routing, new_rules.routing, user_rules),
         ).compact()
 
         final, fitted, budget_warnings = self._render_with_budget(
@@ -956,6 +1080,10 @@ class AgentsMdManager:
             ("quirk", rules.quirks),
             ("pitfall", rules.pitfalls),
         ]
+
+    @classmethod
+    def _all_items(cls, rules: RuleSet) -> list[tuple[str, list[str]]]:
+        return [*cls._rule_items(rules), ("routing", rules.routing)]
 
     def _fitted_payload(
         self,
@@ -1025,10 +1153,14 @@ class AgentsMdManager:
                 if not _is_self_referential(rule)
                 and not _is_non_causal_recovery(rule)
             )
+            parsed.routing.extend(
+                item for item in block_rules.routing if _clean_routing_item(item)
+            )
         cleaned = RuleSet(
             directives=_dedupe(parsed.directives),
             quirks=_dedupe(parsed.quirks),
             pitfalls=_dedupe(parsed.pitfalls),
+            routing=_dedupe(parsed.routing),
         )
         final, fitted, warnings = self._render_with_budget(
             user_content, cleaned, is_workspace, newline=newline, encoding=encoding
@@ -1108,13 +1240,22 @@ class AgentsMdManager:
                     current = data.quirks
                 elif SECTION_PITFALLS.lower() in lowered:
                     current = data.pitfalls
+                elif SECTION_ROUTING.lower() in lowered:
+                    current = data.routing
                 else:
                     current = None
                 continue
             if line.startswith(("- ", "* ", "+ ")):
+                if current is data.routing:
+                    item = _clean_routing_item(line[2:].strip())
+                    if item:
+                        current.append(item)
+                    continue
                 rule = sanitize_rule(line[2:].strip(), global_scope=global_scope)
                 if rule and current is not None:
                     current.append(rule)
+                continue
+            if current is data.routing:
                 continue
             if current is not None and line != ">":
                 # Continuation of a previous bullet (usually a wrapped noise
@@ -1145,6 +1286,10 @@ class AgentsMdManager:
             lines.append(f"### {SECTION_PITFALLS}")
             lines.extend(f"- {rule}" for rule in rules.pitfalls)
             lines.append("")
+        if rules.routing:
+            lines.append(f"### {SECTION_ROUTING} (auto-selected)")
+            lines.extend(f"- {item}" for item in rules.routing)
+            lines.append("")
         lines.append(HARNESS_FOOTER)
         return "\n".join(lines).strip()
 
@@ -1174,11 +1319,21 @@ class AgentsMdManager:
         encoding: str = "utf-8",
     ) -> tuple[str, RuleSet, list[str]]:
         warnings: list[str] = []
-        fitted = RuleSet(rules.directives[:], rules.quirks[:], rules.pitfalls[:])
+        fitted = RuleSet(
+            rules.directives[:],
+            rules.quirks[:],
+            rules.pitfalls[:],
+            rules.routing[:],
+        )
         user = user_content.strip()
         removed: list[str] = []
-        section_weights = {"pitfall": 0.05, "quirk": 0.03, "directive": 0.01}
-        section_rank = {"pitfall": 0, "quirk": 1, "directive": 2}
+        section_weights = {
+            "pitfall": 0.05,
+            "quirk": 0.03,
+            "routing": 0.01,
+            "directive": 0.01,
+        }
+        section_rank = {"pitfall": 0, "quirk": 1, "routing": 2, "directive": 3}
 
         def render(current: RuleSet) -> str:
             managed = self._format_managed_block(current, is_workspace) if current else ""
@@ -1199,9 +1354,11 @@ class AgentsMdManager:
                     removed.append(fitted.quirks.pop(0))
                 elif fitted.directives:
                     removed.append(fitted.directives.pop(0))
+                elif fitted.routing:
+                    removed.append(fitted.routing.pop(0))
             else:
                 choices: list[tuple[float, int, int, str, list[str]]] = []
-                for section, items in self._rule_items(fitted):
+                for section, items in self._all_items(fitted):
                     for index, text in enumerate(items):
                         try:
                             score = float(self.priority(text))

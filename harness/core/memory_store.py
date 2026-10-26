@@ -26,13 +26,16 @@ from typing import Any, Generator, Sequence
 
 from .analyzer import ContrastiveEvent, SessionAnalysis
 from .config import (
-    get_experience_md_path,
+    get_effective_experience_md_path,
+    get_effective_memory_db_path,
+    get_lesson_id_counter_path,
     get_memory_db_path,
     project_fingerprint,
 )
 from .redaction import redact_mapping
 from .util import (
     atomic_write_text,
+    file_lock,
     normalize_for_compare,
     one_line,
     read_json,
@@ -219,14 +222,26 @@ class MemoryStore:
         initialize: bool = True,
         read_only: bool = False,
     ):
-        self.db_path = Path(db_path) if db_path else get_memory_db_path()
-        self.exp_md_path = Path(exp_md_path) if exp_md_path else get_experience_md_path()
         self.workspace = str(workspace) if workspace else ""
         self.project = project_fingerprint(self.workspace) if self.workspace else "global"
+        self.db_path = (
+            Path(db_path)
+            if db_path
+            else get_effective_memory_db_path(self.workspace or None)
+        )
+        self.exp_md_path = (
+            Path(exp_md_path)
+            if exp_md_path
+            else get_effective_experience_md_path(self.workspace or None)
+        )
+        self.isolated = self.db_path != get_memory_db_path()
         self.fts_enabled = False
         self.read_only = read_only
+        created = not self.db_path.exists()
         if initialize:
             self._init_db()
+            if created and self.isolated and not read_only:
+                self._seed_from_global()
         elif self.db_path.exists():
             self.fts_enabled = self._detect_fts()
 
@@ -336,6 +351,107 @@ class MemoryStore:
             except sqlite3.DatabaseError:
                 # FTS5 is optional. Search falls back to LIKE.
                 self.fts_enabled = False
+
+    def _advance_lesson_id_counter(self, minimum: int = 0) -> int:
+        """Raise the shared "last issued id" counter to at least ``minimum``."""
+        counter_path = get_lesson_id_counter_path()
+        lock_path = counter_path.with_name(counter_path.name + ".lock")
+        with file_lock(lock_path, timeout=5.0):
+            try:
+                reserved = int(counter_path.read_text(encoding="utf-8").strip() or "0")
+            except (OSError, ValueError):
+                reserved = 0
+            value = max(reserved, int(minimum or 0))
+            if value > reserved:
+                try:
+                    counter_path.write_text(str(value), encoding="utf-8")
+                except OSError:
+                    pass
+            return value
+
+    def _next_lesson_id(self, conn: sqlite3.Connection) -> int:
+        """Reserve a lesson id that is unique across isolated databases."""
+        try:
+            row = conn.execute("SELECT MAX(id) FROM lessons").fetchone()
+            highest = int(row[0] or 0) if row else 0
+        except sqlite3.DatabaseError:
+            highest = 0
+        counter_path = get_lesson_id_counter_path()
+        lock_path = counter_path.with_name(counter_path.name + ".lock")
+        with file_lock(lock_path, timeout=5.0):
+            try:
+                reserved = int(counter_path.read_text(encoding="utf-8").strip() or "0")
+            except (OSError, ValueError):
+                reserved = 0
+            next_id = max(reserved, highest) + 1
+            try:
+                counter_path.write_text(str(next_id), encoding="utf-8")
+            except OSError:
+                pass
+            return next_id
+
+    def _seed_from_global(self) -> None:
+        """Copy pre-existing global environment lessons into a new project store.
+
+        Projects are isolated, but environment lessons that were learned before
+        isolation was enabled should not silently disappear. This runs once,
+        when the project database is first created, and only copies rows whose
+        project scope is ``global``; another project's lessons are never
+        imported.
+        """
+        global_path = get_memory_db_path()
+        if not self.workspace or not global_path.exists():
+            return
+        if self.db_path.resolve() == global_path.resolve():
+            return
+        try:
+            source = sqlite3.connect(
+                "file:" + global_path.as_posix() + "?mode=ro", uri=True, timeout=5
+            )
+            source.row_factory = sqlite3.Row
+        except sqlite3.DatabaseError:
+            return
+        try:
+            with self._connect() as conn:
+                marked = conn.execute(
+                    "SELECT value FROM meta WHERE key = 'seeded_from_global'"
+                ).fetchone()
+                if marked:
+                    return
+                conn.execute(
+                    "INSERT INTO meta(key, value) VALUES('seeded_from_global', '1') "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+                )
+                try:
+                    rows = source.execute(
+                        "SELECT id, fingerprint, conversation_id, project, workspace, "
+                        "scope, category, trigger_tool, error_pattern, resolution, "
+                        "occurrences, first_seen, last_seen, confidence, verified, "
+                        "source, surfaced_count, last_surfaced_at, "
+                        "post_surface_occurrences "
+                        "FROM lessons WHERE project = 'global'"
+                    ).fetchall()
+                except sqlite3.DatabaseError:
+                    return
+                for row in rows:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO lessons "
+                        "(id, fingerprint, conversation_id, project, workspace, scope, "
+                        "category, trigger_tool, error_pattern, resolution, occurrences, "
+                        "first_seen, last_seen, confidence, verified, source, "
+                        "surfaced_count, last_surfaced_at, post_surface_occurrences) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        tuple(row),
+                    )
+                if rows:
+                    # Seeded ids come from the shared sequence; keep the counter
+                    # ahead of them so new project rows cannot reuse them.
+                    highest = max(int(row["id"] or 0) for row in rows)
+                    self._advance_lesson_id_counter(highest)
+        except (sqlite3.DatabaseError, OSError):
+            return
+        finally:
+            source.close()
 
     def _schema_ready(self, conn: sqlite3.Connection) -> bool:
         """Return True when the current schema and FTS triggers are usable."""
@@ -801,11 +917,12 @@ class MemoryStore:
                 else:
                     conn.execute(
                         "INSERT INTO lessons "
-                        "(fingerprint, conversation_id, project, workspace, scope, category, "
+                        "(id, fingerprint, conversation_id, project, workspace, scope, category, "
                         "trigger_tool, error_pattern, resolution, occurrences, first_seen, "
                         "last_seen, confidence, verified, source) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, 'transcript')",
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, 'transcript')",
                         (
+                            self._next_lesson_id(conn),
                             fingerprint,
                             analysis.conversation_id or event.session_id or None,
                             project,
@@ -848,6 +965,38 @@ class MemoryStore:
 
         return {"created": created, "updated": updated, "skipped": skipped}
 
+    def _sibling_stores(self) -> list["MemoryStore"]:
+        """Open the other project databases for ``all_projects`` queries.
+
+        Read-only peers are used, and a read-only store never fans out again, so
+        this cannot recurse.
+        """
+        from .config import get_project_memory_db_paths, project_isolation_enabled
+
+        if self.read_only or not project_isolation_enabled():
+            return []
+        try:
+            current = self.db_path.resolve()
+        except OSError:
+            current = self.db_path
+        seen = {current}
+        stores: list[MemoryStore] = []
+        for path in (get_memory_db_path(), *get_project_memory_db_paths()):
+            try:
+                resolved = path.resolve()
+            except OSError:
+                resolved = path
+            if resolved in seen or not path.exists():
+                continue
+            seen.add(resolved)
+            try:
+                stores.append(
+                    MemoryStore(db_path=path, workspace=None, read_only=True)
+                )
+            except (sqlite3.DatabaseError, OSError):
+                continue
+        return stores
+
     def get_recent_lessons(
         self,
         limit: int = 10,
@@ -873,6 +1022,16 @@ class MemoryStore:
                 (*params, candidate_limit),
             ).fetchall()
         lessons = [self._lesson_dict(row) for row in rows]
+        if all_projects:
+            lessons = self._merge_project_results(
+                lessons,
+                "get_recent_lessons",
+                limit=limit,
+                workspace=workspace,
+                project=project,
+                verified_only=verified_only,
+                include_global=include_global,
+            )
         lessons.sort(
             key=lambda item: (
                 lesson_utility(item),
@@ -881,6 +1040,28 @@ class MemoryStore:
             reverse=True,
         )
         return lessons[:limit]
+
+    def _merge_project_results(
+        self,
+        results: list[dict[str, Any]],
+        method: str,
+        **kwargs: Any,
+    ) -> list[dict[str, Any]]:
+        """Union local results with every other project database."""
+        merged = list(results)
+        seen = {item.get("id") for item in merged}
+        for peer in self._sibling_stores():
+            try:
+                extra = getattr(peer, method)(**kwargs, all_projects=True)
+            except (sqlite3.DatabaseError, OSError):
+                continue
+            for item in extra:
+                lesson_id = item.get("id")
+                if lesson_id in seen:
+                    continue
+                seen.add(lesson_id)
+                merged.append(item)
+        return merged
 
     def search_lessons(
         self,
@@ -945,6 +1126,16 @@ class MemoryStore:
                 ).fetchall()
 
         lessons = [self._lesson_dict(row) for row in rows]
+        if all_projects:
+            lessons = self._merge_project_results(
+                lessons,
+                "search_lessons",
+                query=query,
+                limit=limit,
+                workspace=workspace,
+                include_global=include_global,
+                verified_only=verified_only,
+            )
         lessons.sort(
             key=lambda item: (
                 lesson_utility(item),
@@ -1048,7 +1239,24 @@ class MemoryStore:
                 "ORDER BY verified DESC, last_seen DESC, id DESC LIMIT ?",
                 (*params, limit),
             ).fetchall()
-        return [self._lesson_dict(row) for row in rows]
+        lessons = [self._lesson_dict(row) for row in rows]
+        if all_projects:
+            lessons = self._merge_project_results(
+                lessons,
+                "list_lessons",
+                limit=limit,
+                workspace=workspace,
+                include_candidates=include_candidates,
+            )
+            lessons.sort(
+                key=lambda item: (
+                    int(bool(item.get("verified"))),
+                    str(item.get("last_seen") or ""),
+                    int(item.get("id") or 0),
+                ),
+                reverse=True,
+            )
+        return lessons[:limit]
 
     def add_lesson(
         self,
@@ -1083,18 +1291,20 @@ class MemoryStore:
         )
         now = utc_iso()
         with self._connect() as conn:
+            lesson_id = self._next_lesson_id(conn)
             conn.execute(
                 "INSERT INTO lessons "
-                "(fingerprint, conversation_id, project, workspace, scope, category, "
+                "(id, fingerprint, conversation_id, project, workspace, scope, category, "
                 "trigger_tool, error_pattern, resolution, occurrences, first_seen, "
                 "last_seen, confidence, verified, source) "
-                "VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?) "
+                "VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(fingerprint) DO UPDATE SET "
                 "resolution = excluded.resolution, "
                 "confidence = MAX(lessons.confidence, excluded.confidence), "
                 "verified = MAX(lessons.verified, excluded.verified), "
                 "last_seen = excluded.last_seen",
                 (
+                    lesson_id,
                     fingerprint,
                     project,
                     workspace_str or None,
@@ -1709,6 +1919,34 @@ class MemoryStore:
         workspace: str | Path | None = None,
         all_projects: bool = False,
     ) -> dict[str, Any]:
+        stats = self._stats_local(workspace, all_projects)
+        if all_projects and not self.read_only:
+            for peer in self._sibling_stores():
+                try:
+                    extra = peer._stats_local(None, True, exclude_global_lessons=True)
+                except (sqlite3.DatabaseError, OSError):
+                    continue
+                for key in (
+                    "sessions",
+                    "verified_lessons",
+                    "candidate_lessons",
+                    "skills",
+                    "rule_edits",
+                ):
+                    stats[key] += int(extra.get(key) or 0)
+                stats["last_lesson_at"] = max(
+                    str(stats.get("last_lesson_at") or ""),
+                    str(extra.get("last_lesson_at") or ""),
+                )
+                stats["project_stores"] = int(stats.get("project_stores") or 0) + 1
+        return stats
+
+    def _stats_local(
+        self,
+        workspace: str | Path | None,
+        all_projects: bool,
+        exclude_global_lessons: bool = False,
+    ) -> dict[str, Any]:
         if not self.db_path.exists():
             return {
                 "db_path": str(self.db_path),
@@ -1724,15 +1962,25 @@ class MemoryStore:
         where, params = self._scope_filter(
             workspace, None, True, all_projects=all_projects
         )
+        lesson_where = list(where)
+        if exclude_global_lessons:
+            lesson_where.append("project != 'global'")
         clause = f"WHERE {' AND '.join(where)}" if where else ""
-        lesson_clause = f"{clause} AND verified = 1" if clause else "WHERE verified = 1"
-        candidate_clause = f"{clause} AND verified = 0" if clause else "WHERE verified = 0"
+        lesson_clause = (
+            f"WHERE {' AND '.join(lesson_where)}" if lesson_where else ""
+        )
+        verified_clause = (
+            f"{lesson_clause} AND verified = 1" if lesson_clause else "WHERE verified = 1"
+        )
+        candidate_clause = (
+            f"{lesson_clause} AND verified = 0" if lesson_clause else "WHERE verified = 0"
+        )
         with self._connect() as conn:
             sessions = conn.execute(
                 f"SELECT COUNT(*) FROM sessions {clause}", tuple(params)
             ).fetchone()[0]
             verified = conn.execute(
-                f"SELECT COUNT(*) FROM lessons {lesson_clause}", tuple(params)
+                f"SELECT COUNT(*) FROM lessons {verified_clause}", tuple(params)
             ).fetchone()[0]
             candidates = conn.execute(
                 f"SELECT COUNT(*) FROM lessons {candidate_clause}", tuple(params)
@@ -1742,7 +1990,7 @@ class MemoryStore:
             ).fetchone()[0]
             rule_edits = conn.execute("SELECT COUNT(*) FROM rule_edits").fetchone()[0]
             last = conn.execute(
-                f"SELECT MAX(last_seen) FROM lessons {clause}", tuple(params)
+                f"SELECT MAX(last_seen) FROM lessons {lesson_clause}", tuple(params)
             ).fetchone()[0]
         return {
             "db_path": str(self.db_path),
@@ -2073,6 +2321,7 @@ class MemoryStore:
                     continue
 
                 values = (
+                    self._next_lesson_id(conn),
                     fingerprint,
                     row.get("conversation_id"),
                     row.get("project") or "global",
@@ -2094,11 +2343,11 @@ class MemoryStore:
                 )
                 statement = (
                     "INSERT INTO lessons "
-                    "(fingerprint, conversation_id, project, workspace, scope, category, "
+                    "(id, fingerprint, conversation_id, project, workspace, scope, category, "
                     "trigger_tool, error_pattern, resolution, occurrences, first_seen, last_seen, "
                     "confidence, verified, source, surfaced_count, last_surfaced_at, "
                     "post_surface_occurrences) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT(fingerprint) DO UPDATE SET "
                     "conversation_id=excluded.conversation_id, project=excluded.project, "
                     "workspace=excluded.workspace, scope=excluded.scope, "

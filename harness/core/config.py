@@ -12,7 +12,7 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 USER_HOME = Path.home()
 # Initial values are kept for backward compatibility with v1 imports. Functions
@@ -83,8 +83,107 @@ def get_memory_db_path() -> Path:
     return get_memory_dir(create=False) / "harness_memory.db"
 
 
+def get_project_memory_dir(
+    workspace_root: Path | str | None, create: bool = False
+) -> Path:
+    """Per-project memory directory, isolated by workspace fingerprint.
+
+    Project data lives under the plugin's memory directory rather than inside
+    the user's repository. That keeps ``git status`` clean while still giving
+    every project a physically separate database, experience log, and future
+    exports.
+    """
+    fingerprint = project_fingerprint(workspace_root)
+    path = get_memory_dir(create=False) / "projects" / fingerprint
+    if create:
+        path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def get_project_memory_db_path(workspace_root: Path | str | None) -> Path:
+    return get_project_memory_dir(workspace_root) / "harness_memory.db"
+
+
+def get_project_memory_db_paths() -> list[Path]:
+    """Every existing per-project database (used by all-project queries)."""
+    root = get_memory_dir(create=False) / "projects"
+    if not root.is_dir():
+        return []
+    try:
+        return sorted(root.glob("*/harness_memory.db"))
+    except OSError:
+        return []
+
+
+def get_project_experience_md_path(workspace_root: Path | str | None) -> Path:
+    return get_project_memory_dir(workspace_root) / "EXPERIENCE.md"
+
+
 def get_experience_md_path() -> Path:
     return get_memory_dir(create=False) / "EXPERIENCE.md"
+
+
+def get_lesson_id_counter_path() -> Path:
+    """Shared monotonic lesson-id counter.
+
+    Project databases are physically isolated, so SQLite's per-database
+    AUTOINCREMENT would hand out the same ids in every project. Lesson ids are
+    user-facing (``harness memory show <id>``), so they must stay unique across
+    the global store and every project store.
+    """
+    return get_state_dir() / "lesson_ids.seq"
+
+
+def get_workspace_tools_path(workspace_root: Path | str | None = None) -> Path:
+    """Project-declared tool routing file (optional)."""
+    root = Path(workspace_root).expanduser() if workspace_root else Path.cwd()
+    return root / ".agents" / "tools.json"
+
+
+def _setting(section: str, key: str, default: Any) -> Any:
+    """Read one setting without making config import settings at module load."""
+    try:
+        from .settings import get_setting, load_settings
+
+        settings, _warnings = load_settings()
+        return get_setting(settings, f"{section}.{key}", default)
+    except Exception:
+        return default
+
+
+def _env_flag(name: str) -> bool | None:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return None
+    return raw.strip().lower() not in ("0", "false", "no", "off", "disabled")
+
+
+def project_isolation_enabled() -> bool:
+    """Whether project memory/experience should be stored per project."""
+    override = _env_flag("HARNESS_PROJECT_ISOLATION")
+    if override is not None:
+        return override
+    return bool(_setting("project", "isolate_memory", True))
+
+
+def project_skills_only() -> bool:
+    """Whether skill discovery is limited to the current workspace."""
+    override = _env_flag("HARNESS_PROJECT_SKILLS_ONLY")
+    if override is not None:
+        return override
+    return bool(_setting("project", "project_skills_only", True))
+
+
+def get_effective_memory_db_path(workspace_root: Path | str | None) -> Path:
+    if workspace_root and project_isolation_enabled():
+        return get_project_memory_db_path(workspace_root)
+    return get_memory_db_path()
+
+
+def get_effective_experience_md_path(workspace_root: Path | str | None) -> Path:
+    if workspace_root and project_isolation_enabled():
+        return get_project_experience_md_path(workspace_root)
+    return get_experience_md_path()
 
 
 def get_hook_error_log_path() -> Path:

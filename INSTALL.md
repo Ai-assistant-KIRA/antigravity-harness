@@ -126,15 +126,18 @@ python install_plugin.py --rollback
 
 | Path | Contents |
 | :--- | :--- |
-| `<plugin>/memory/harness_memory.db` | Sessions, lessons, candidates, skills index |
+| `<plugin>/memory/harness_memory.db` | Global sessions, lessons, candidates, skills index |
 | `<plugin>/memory/EXPERIENCE.md` | Generated human-readable experience log |
+| `<plugin>/memory/projects/<fingerprint>/harness_memory.db` | Per-project memory (isolated) |
+| `<plugin>/memory/projects/<fingerprint>/EXPERIENCE.md` | Per-project experience log |
 | `<plugin>/state/events.jsonl` | Hook event journal |
 | `<plugin>/state/pending/` | Per-conversation tool observations |
 | `<plugin>/state/hook_errors.log` | Hook failures, if any |
 | `<plugin>/rules/AGENTS.md` | Curated global rules |
 | `<plugin>/skills/` | Bundled and learned skills |
-| `<workspace>/AGENTS.md` | Workspace rules, inside the managed block |
+| `<workspace>/AGENTS.md` | Workspace rules and task routing, inside the managed block |
 | `<workspace>/.agents/skills/` | Workspace skills |
+| `<workspace>/.agents/tools.json` | Optional project tool vocabulary |
 
 The database and state files are local. The plugin does not upload them.
 
@@ -161,6 +164,16 @@ prune_days = 365
 candidate_days = 30
 max_lessons = 2000
 
+[project]
+isolate_memory = true
+project_skills_only = true
+
+[routing]
+enabled = true
+auto_apply = true
+max_skills = 5
+max_tools = 6
+
 [hooks]
 stop_timeout = 90
 post_tool_use_timeout = 5
@@ -172,6 +185,8 @@ Environment variables:
 | :--- | :--- | :--- |
 | `HARNESS_PLUGIN_DIR` | `~/.gemini/config/plugins/harness` | Plugin and data root |
 | `HARNESS_GEMINI_CONFIG_DIR` | `~/.gemini/config` | Antigravity config root |
+| `HARNESS_PROJECT_ISOLATION` | unset | Force per-project memory on (`1`) or off (`0`) |
+| `HARNESS_PROJECT_SKILLS_ONLY` | unset | Force project-local skill loading on (`1`) or off (`0`) |
 | `ANTIGRAVITY_APP_DATA_DIR` | auto-detected | Conversation transcripts |
 | `ANTIGRAVITY_CONVERSATION_ID` | empty | Fallback conversation ID |
 | `HARNESS_DEBUG` | unset | Show tracebacks from the CLI |

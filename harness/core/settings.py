@@ -49,6 +49,16 @@ DEFAULT_SETTINGS: dict[str, dict[str, Any]] = {
         "stop_timeout": 90,
         "post_tool_use_timeout": 5,
     },
+    "project": {
+        "isolate_memory": True,
+        "project_skills_only": True,
+    },
+    "routing": {
+        "enabled": True,
+        "auto_apply": True,
+        "max_skills": 5,
+        "max_tools": 6,
+    },
 }
 
 # section -> key -> (kind, minimum, maximum)
@@ -73,6 +83,16 @@ _SPEC: dict[str, dict[str, tuple[str, float | int | None, float | int | None]]] 
     "hooks": {
         "stop_timeout": ("int", 1, None),
         "post_tool_use_timeout": ("int", 1, None),
+    },
+    "project": {
+        "isolate_memory": ("bool", None, None),
+        "project_skills_only": ("bool", None, None),
+    },
+    "routing": {
+        "enabled": ("bool", None, None),
+        "auto_apply": ("bool", None, None),
+        "max_skills": ("int", 0, None),
+        "max_tools": ("int", 0, None),
     },
 }
 
@@ -174,6 +194,13 @@ def _coerce(
                 f"using default {default!r}"
             )
             return False, default
+    elif kind == "bool":
+        if not isinstance(value, bool):
+            warnings.append(
+                f"{source}: {section}.{key} must be true or false; "
+                f"using default {default!r}"
+            )
+            return False, default
     else:  # pragma: no cover - guard against a future typo in _SPEC
         return False, default
 
@@ -192,6 +219,8 @@ def _coerce(
 
     if kind == "number":
         return True, float(value)
+    if kind == "bool":
+        return True, bool(value)
     return True, int(value)
 
 
