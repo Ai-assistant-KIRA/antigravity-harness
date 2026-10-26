@@ -32,6 +32,7 @@ from .core.retrieval import find_recall, format_recall_message
 from .core.router import TaskRouter
 from .core.settings import get_setting, load_settings
 from .core.skill_builder import SkillBuilder, SkillError
+from .core.skill_diagnostics import diagnose_skill_generation
 from .core.trust import audit_privacy
 from .core.util import jaccard, normalize_for_compare, one_line
 
@@ -314,6 +315,53 @@ def cmd_skills(args: argparse.Namespace) -> None:
     workspace = _workspace(args)
     builder = SkillBuilder(workspace)
     store = MemoryStore(workspace=workspace)
+
+    if action in ("why", "diagnose"):
+        report = diagnose_skill_generation(
+            workspace=workspace,
+            limit=max(1, int(getattr(args, "limit", None) or 10)),
+            memory=store,
+        )
+        if args.json:
+            _echo(report, True)
+            return
+        print("=" * 68)
+        print("[HARNESS] Why skills were (or were not) generated")
+        print("=" * 68)
+        print(f"Scope        : {report['workspace'] or 'all projects'}")
+        print(f"Min quality  : {report['min_quality']:.2f}")
+        print(f"Skills index : {report['skills_indexed']} harness-managed skill(s)")
+        print(f"Eligible now : {report['eligible']} workflow(s) ready to write")
+        if not report["sessions"]:
+            print("\nNo recorded sessions yet. Run a task in Antigravity first.")
+            return
+        for entry in report["sessions"]:
+            scope = Path(entry["workspace"]).name if entry["workspace"] else "global"
+            print()
+            print(
+                f"- {entry['conversation_id'][:8]} | {entry['updated_at'][:16]} | "
+                f"{scope} | outcome={entry['outcome'] or 'unknown'} | "
+                f"tasks={entry['tasks']}"
+            )
+            if entry["task_summary"]:
+                print(f"    prompt: {entry['task_summary']}")
+            if entry.get("error"):
+                print(f"    ! {entry['error']}")
+                continue
+            workflows = entry["workflows"]
+            if not workflows:
+                print("    no task segment reached the workflow extractor")
+            for workflow in workflows:
+                label = workflow.get("name") or "unnamed"
+                detail = f"quality {float(workflow.get('quality') or 0):.2f}"
+                if workflow.get("steps"):
+                    detail += f", {workflow['steps']} step(s)"
+                print(f"    * {label} ({detail})")
+                print(f"      task  : {one_line(str(workflow.get('task') or ''), 120)}")
+                print(f"      verdict: {workflow.get('verdict')}")
+        print("=" * 68)
+        print("Note: skills you installed manually are not tracked here.")
+        return
 
     if action in ("list", "ls"):
         skills = builder.list_installed_skills(workspace)
@@ -1294,9 +1342,10 @@ def build_parser() -> argparse.ArgumentParser:
         "action",
         nargs="?",
         default="list",
-        choices=["list", "ls", "show", "inspect", "install", "remove", "validate", "check"],
+        choices=["list", "ls", "show", "inspect", "install", "remove", "validate", "check", "why", "diagnose"],
     )
     p_skills.add_argument("target", nargs="?", help="skill name or install source")
+    p_skills.add_argument("--limit", type=int, default=10, help="sessions to inspect for 'why' (default 10)")
     p_skills.add_argument("--name", "-n", help="skill name")
     p_skills.add_argument("--source", help="local path, GitHub repo, or URL to install")
     p_skills.add_argument(

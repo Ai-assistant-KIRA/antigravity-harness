@@ -191,6 +191,7 @@ macOS/Linux use `bin/harness`.
 | `harness route "task text"` | Route project skills and tools into this project's `AGENTS.md` |
 | `harness memory search "pytest"` | Search stored lessons |
 | `harness skills list` | Inspect the learned skill library |
+| `harness skills why` | Replay recent sessions and show why each task did or did not become a skill |
 | `harness rules why "rule text"` | Show evidence and provenance for a rule |
 | `harness rules conflicts` | Find opposing managed rules |
 | `harness privacy audit` | Review retained data without dumping content |

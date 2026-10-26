@@ -760,6 +760,26 @@ class MemoryStore:
             return []
 
     # ----------------------------------------------------------------- sessions
+    def list_sessions(
+        self,
+        limit: int = 15,
+        workspace: str | Path | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return recently updated sessions, newest first."""
+        where: list[str] = []
+        params: list[Any] = []
+        if workspace:
+            where.append("workspace = ?")
+            params.append(str(workspace))
+        clause = f"WHERE {' AND '.join(where)}" if where else ""
+        params.append(max(1, int(limit)))
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM sessions {clause} ORDER BY updated_at DESC LIMIT ?",
+                tuple(params),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def is_session_processed(self, conversation_id: str, transcript_hash: str = "") -> bool:
         if not conversation_id:
             return False

@@ -47,6 +47,36 @@ def one_line(text: str, limit: int = 400) -> str:
     return truncate(cleaned, limit)
 
 
+def short_goal(text: str, limit: int = 100) -> str:
+    """First sentence or clause of a request, without a dangling ellipsis."""
+    cleaned = one_line(text, 300).strip()
+    if not cleaned:
+        return ""
+    first = re.split(r"(?<=[.!?])\s+|;\s+", cleaned)[0].strip()
+    if len(first) > limit:
+        window = first[: limit + 20]
+        cut = max(window.rfind(", "), window.rfind(" and "), window.rfind(" so "))
+        if cut >= limit // 2:
+            first = window[:cut]
+        else:
+            first = first[:limit].rsplit(" ", 1)[0]
+    return first.rstrip(".,;:-")
+
+
+def strip_paths(text: str) -> str:
+    """Remove filesystem paths and URLs so titles and names stay readable."""
+    cleaned = text or ""
+    # Drop quoted paths as a whole: leaving the quotes behind reads like `" "`.
+    cleaned = re.sub(r'"[^"]*[\\/:][^"]*"', " ", cleaned)
+    cleaned = re.sub(r"'[^']*[\\/:][^']*'", " ", cleaned)
+    cleaned = re.sub(r"(?i)\b[a-z]:\\[^\s\"'`]+", " ", cleaned)
+    cleaned = re.sub(r"\\\\[^\s\"'`]+", " ", cleaned)
+    cleaned = re.sub(r"(?i)\bhttps?://\S+", " ", cleaned)
+    cleaned = re.sub(r"(?<![\w.])/(?:[\w.-]+/)+[\w.-]*", " ", cleaned)
+    cleaned = re.sub(r'["\']{2,}', " ", cleaned)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
 def normalize_for_compare(text: str, keep_code: bool = False) -> str:
     """Normalize a rule/step for duplicate detection.
 

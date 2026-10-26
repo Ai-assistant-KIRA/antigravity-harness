@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
-from .analyzer import ContrastiveEvent, WorkflowCandidate
+from .analyzer import MAX_GOAL_WORDS, ContrastiveEvent, WorkflowCandidate
 from .config import (
     get_global_user_skills_dir,
     get_plugin_dir,
@@ -41,6 +41,8 @@ from .util import (
     normalize_for_compare,
     one_line,
     read_text_lossless,
+    short_goal,
+    strip_paths,
     truncate,
     utc_iso,
 )
@@ -99,7 +101,7 @@ def _is_actionable_goal(text: str) -> bool:
         return False
     if any(phrase in lowered for phrase in _EXPLORATORY_PHRASES):
         return False
-    return len(value.split()) <= 16
+    return len(value.split()) <= MAX_GOAL_WORDS
 
 
 def _is_self_referential(*values: object) -> bool:
@@ -373,7 +375,7 @@ class SkillBuilder:
         return name or "harness-skill"
 
     def _description(self, workflow: WorkflowCandidate) -> str:
-        goal = one_line(workflow.goal, 180).rstrip(".")
+        goal = short_goal(strip_paths(workflow.goal), 150)
         keywords = ", ".join(workflow.trigger_keywords[:6])
         description = f"Repeatable procedure for: {goal}."
         if keywords:
@@ -392,7 +394,7 @@ class SkillBuilder:
         version: int,
         user_tail: str = "",
     ) -> str:
-        title = one_line(workflow.goal or name.replace("-", " "), 90).rstrip(".")
+        title = short_goal(strip_paths(workflow.goal), 90) or name.replace("-", " ")
         trigger = workflow.trigger_keywords[:8]
         metadata = {
             "version": version,
@@ -415,7 +417,7 @@ class SkillBuilder:
             "> Learned and maintained by Harness². Edit only the notes below the managed block.",
             "",
             "## When to Use",
-            f"- The task matches: {one_line(workflow.goal, 180)}",
+            f"- The task matches: {short_goal(strip_paths(workflow.goal), 180)}",
         ]
         if trigger:
             lines.append(f"- Relevant signals: {', '.join(trigger)}")

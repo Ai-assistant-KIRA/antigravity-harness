@@ -23,12 +23,20 @@ from typing import Any
 
 from .config import detect_project_signals, get_plugin_dir, tokenize
 from .redaction import redact
-from .util import jaccard, normalize_for_compare, one_line, truncate
+from .util import jaccard, normalize_for_compare, one_line, short_goal, strip_paths, truncate
 
 # A session can grow for hours. Bound the Stop-hook work so a pathological
 # transcript cannot exhaust memory or exceed the host's hook timeout.
 MAX_TRANSCRIPT_BYTES = 64 * 1024 * 1024
 MAX_TRANSCRIPT_LINES = 100_000
+
+# Real user requests are longer than a single sentence fragment. The goal gate
+# stays generous about length while still rejecting questions and pure research
+# prompts, which can never describe a procedure.
+MAX_GOAL_WORDS = 48
+# One session can contain several unrelated tasks. Cap extraction so a long
+# session cannot flood the skills directory.
+MAX_WORKFLOWS_PER_SESSION = 3
 
 
 @dataclass
@@ -45,6 +53,9 @@ class ToolExecution:
     confidence: float = 1.0
     success: bool = True
     has_evidence: bool = False
+    # Which user turn this call belongs to, so workflows are scoped to the task
+    # that actually produced them instead of always the first prompt.
+    task_index: int = -1
 
     def command(self) -> str:
         if isinstance(self.args, dict):
@@ -111,6 +122,7 @@ class SessionAnalysis:
     contrastive_events: list[ContrastiveEvent] = field(default_factory=list)
     unresolved_events: list[ContrastiveEvent] = field(default_factory=list)
     workflows: list[WorkflowCandidate] = field(default_factory=list)
+    workflow_diagnostics: list[dict[str, Any]] = field(default_factory=list)
     user_constraints: list[str] = field(default_factory=list)
     environment_quirks: list[str] = field(default_factory=list)
     skill_usage: list[str] = field(default_factory=list)
@@ -249,6 +261,8 @@ class TranscriptAnalyzer:
         pending: list[ToolExecution] = []
         final_assistant: list[str] = []
         failed_candidates: list[ToolExecution] = []
+        canonical_tasks: list[str] = []
+        current_task_index = -1
 
         for step in steps:
             step_type = str(step.get("type", "") or "")
@@ -268,6 +282,17 @@ class TranscriptAnalyzer:
                 failed_candidates = []
                 clean = self._clean_user_text(content)
                 if clean:
+                    canonical = next(
+                        (
+                            index for index, existing in enumerate(canonical_tasks)
+                            if jaccard(clean, existing) > 0.9
+                        ),
+                        None,
+                    )
+                    if canonical is None:
+                        canonical_tasks.append(clean)
+                        canonical = len(canonical_tasks) - 1
+                    current_task_index = canonical
                     analysis.tasks.append(clean)
                     self._extract_user_constraints(clean, analysis.user_constraints)
                 continue
@@ -280,6 +305,7 @@ class TranscriptAnalyzer:
                         args=args,
                         step_index=int(step.get("step_index", step.get("stepIndex", len(executions))) or 0) + index,
                         status=status or "DONE",
+                        task_index=current_task_index,
                     )
                     executions.append(execution)
                     pending.append(execution)
@@ -392,6 +418,7 @@ class TranscriptAnalyzer:
             workspace=workspace,
             conversation_id=conversation_id,
             outcome=analysis.final_outcome,
+            diagnostics=analysis.workflow_diagnostics,
         )
         analysis.workflows.extend(workflows)
         return analysis
@@ -1158,13 +1185,117 @@ class TranscriptAnalyzer:
         workspace: str | Path | None = None,
         conversation_id: str = "",
         outcome: str = "completed",
+        diagnostics: list[dict[str, Any]] | None = None,
     ) -> list[WorkflowCandidate]:
+        """Extract one workflow per actionable user task.
+
+        A long session usually contains several unrelated requests. Keying the
+        whole transcript on ``tasks[0]`` both missed the real work and let one
+        abandoned prompt veto every skill in the session.
+        """
+        workflows: list[WorkflowCandidate] = []
+        used_names: set[str] = set()
+        for task, segment in self._task_segments(tasks, executions):
+            candidate, reason = self._workflow_for_task(
+                task,
+                segment,
+                contrasts,
+                workspace=workspace,
+                conversation_id=conversation_id,
+                outcome=outcome,
+            )
+            if candidate is not None:
+                candidate.name = self._unique_workflow_name(
+                    candidate.name, candidate.goal, segment, used_names
+                )
+                used_names.add(candidate.name)
+            if diagnostics is not None:
+                note: dict[str, Any] = {
+                    "task": one_line(task, 200),
+                    "tool_calls": len(segment),
+                    "status": "candidate" if candidate else "skipped",
+                    "reason": reason,
+                }
+                if candidate is not None:
+                    note.update(
+                        name=candidate.name,
+                        quality=candidate.quality_score,
+                        success=candidate.success,
+                        steps=len(candidate.steps),
+                    )
+                diagnostics.append(note)
+            if candidate is not None:
+                workflows.append(candidate)
+        workflows.sort(key=lambda item: (-item.quality_score, -len(item.steps)))
+        return workflows[:MAX_WORKFLOWS_PER_SESSION]
+
+    def _unique_workflow_name(
+        self,
+        name: str,
+        goal: str,
+        executions: list[ToolExecution],
+        used: set[str],
+    ) -> str:
+        """Keep two tasks from the same session from sharing one skill file."""
+        if name not in used:
+            return name
+        alternative = self._fallback_skill_name(goal, executions)
+        if alternative and alternative not in used:
+            return alternative
+        index = 2
+        while f"{name}-{index}" in used:
+            index += 1
+        return f"{name}-{index}"
+
+    @staticmethod
+    def _task_segments(
+        tasks: list[str],
+        executions: list[ToolExecution],
+    ) -> list[tuple[str, list[ToolExecution]]]:
+        """Group tool calls by the user turn that requested them."""
+        if not tasks:
+            return [("repeatable development workflow", list(executions))]
+
+        grouped: dict[int, list[ToolExecution]] = {}
+        loose: list[ToolExecution] = []
+        for execution in executions:
+            index = getattr(execution, "task_index", -1)
+            if index is None or index < 0:
+                loose.append(execution)
+            else:
+                grouped.setdefault(index, []).append(execution)
+
+        segments: list[tuple[str, list[ToolExecution]]] = []
+        for index, task in enumerate(tasks):
+            segment = grouped.get(index)
+            if not segment:
+                continue
+            if index == 0 and loose:
+                # Calls that precede the first recorded user turn still belong
+                # to the opening task.
+                segment = loose + segment
+            segments.append((task, segment))
+        if not segments:
+            # Hand-built transcripts and older snapshots carry no turn
+            # boundaries; fall back to the whole session.
+            return [(tasks[0], list(executions))]
+        return segments
+
+    def _workflow_for_task(
+        self,
+        task: str,
+        executions: list[ToolExecution],
+        contrasts: list[ContrastiveEvent],
+        workspace: str | Path | None = None,
+        conversation_id: str = "",
+        outcome: str = "completed",
+    ) -> tuple[WorkflowCandidate | None, str]:
         successful = [
             execution for execution in executions
             if execution.success and not execution.error and execution.name
         ]
         if len(successful) < 2:
-            return []
+            return None, "fewer than two successful tool calls"
 
         actions: list[str] = []
         tools: set[str] = set()
@@ -1185,46 +1316,50 @@ class TranscriptAnalyzer:
                 verification.append(action)
 
         if not actions or not any("`" in action for action in actions):
-            return []
+            return None, "no repeatable command or file action"
         if len(actions) < 2:
-            return []
+            return None, "needs at least two distinct steps"
         # A single exploratory pair is not a procedure. Require either a real
         # command sequence or a verified recovery that makes the sequence
         # meaningfully repeatable.
         command_actions = [action for action in actions if action.startswith("Run `")]
         if len(command_actions) < 1 and not contrasts:
-            return []
+            return None, "only exploratory/file reads and no verified recovery"
         if len(actions) < 3 and not (contrasts or verification):
-            return []
+            return None, "two steps with no verification or recovery evidence"
 
-        task = tasks[0] if tasks else "repeatable development workflow"
-        task = one_line(task, 240)
-        if not self._is_actionable_goal(task):
-            return []
-        name = self._derive_skill_name(task, successful)
+        goal = one_line(task, 240)
+        if not self._is_actionable_goal(goal):
+            return None, "goal is a question, research prompt, or empty"
+        name = self._derive_skill_name(goal, successful)
         if not name:
-            return []
+            return None, "no skill name could be derived from the task"
+        segment_contrasts = self._segment_contrasts(executions, contrasts)
+        success = self._segment_succeeded(executions, outcome)
         dead_ends = [
             f"`{truncate(str(event.failed_args), 90)}` failed: {truncate(event.error_message, 120)}"
-            for event in contrasts[:6]
+            for event in segment_contrasts[:6]
         ]
-        keywords = self._trigger_keywords(task, successful, workspace)
-        description = self._describe_workflow(task, name, keywords)
+        keywords = self._trigger_keywords(goal, successful, workspace)
+        description = self._describe_workflow(goal, name, keywords)
 
         base_score = 0.35 + min(len(actions), 8) * 0.04 + min(len(tools), 4) * 0.04
         if verification:
             base_score += 0.1
-        if contrasts:
+        if segment_contrasts:
             base_score += 0.12
-        if outcome != "completed":
+        if not success:
             base_score -= 0.2
         quality = round(max(0.0, min(1.0, base_score)), 2)
 
-        return [
+        if not success:
+            return None, "task segment did not end cleanly after recovery"
+
+        return (
             WorkflowCandidate(
                 name=name,
                 description=description,
-                goal=task,
+                goal=goal,
                 steps=actions[:12],
                 tools_involved=sorted(tools),
                 verification_steps=verification[:6],
@@ -1234,10 +1369,55 @@ class TranscriptAnalyzer:
                 quality_score=quality,
                 scope="workspace" if workspace else "global",
                 session_id=conversation_id,
-                success=outcome == "completed",
+                success=success,
                 tags=["auto-synthesized", "verified", "harness"],
-            )
-        ]
+            ),
+            f"candidate: {name} (quality {quality:.2f})",
+        )
+
+    @staticmethod
+    def _segment_succeeded(executions: list[ToolExecution], outcome: str) -> bool:
+        """Decide success for one task, not for the whole session.
+
+        Ending a session mid-flight (interrupt, background job) used to mark
+        every procedure in it as failed. What matters is whether *this* task
+        finished its last action cleanly after any failures were recovered.
+        """
+        if not executions or outcome == "failed":
+            return False
+        last_success = max(
+            (
+                index for index, execution in enumerate(executions)
+                if execution.success and not execution.error
+            ),
+            default=-1,
+        )
+        if last_success < 0:
+            return False
+        return not any(
+            (not execution.success) or bool(execution.error)
+            for execution in executions[last_success + 1:]
+        )
+
+    @staticmethod
+    def _segment_contrasts(
+        executions: list[ToolExecution],
+        contrasts: list[ContrastiveEvent],
+    ) -> list[ContrastiveEvent]:
+        """Keep only recoveries that plausibly belong to this task segment."""
+        if not contrasts:
+            return []
+        segment_tools = {execution.name for execution in executions}
+        segment_text = " ".join(execution.command() for execution in executions).casefold()
+        matched: list[ContrastiveEvent] = []
+        for event in contrasts:
+            if event.trigger_tool not in segment_tools:
+                continue
+            tokens = {token for token in tokenize(str(event.failed_args or "")) if len(token) > 4}
+            if tokens and not any(token in segment_text for token in tokens):
+                continue
+            matched.append(event)
+        return matched
 
     def _action_description(self, execution: ToolExecution) -> str:
         command = execution.command()
@@ -1292,15 +1472,37 @@ class TranscriptAnalyzer:
             return False
         if any(phrase in lowered for phrase in ("research", "look up", "find out", "explain", "compare")):
             return False
-        return len(clean.split()) <= 16
+        return len(clean.split()) <= MAX_GOAL_WORDS
+
+    _NAME_STOPWORDS = frozenset(
+        {
+            "the", "a", "an", "and", "or", "but", "for", "with", "this", "that",
+            "these", "those", "from", "into", "onto", "our", "your", "their",
+            "its", "it", "we", "you", "they", "i", "me", "my", "is", "are",
+            "was", "were", "be", "been", "being", "to", "of", "in", "on", "at",
+            "by", "as", "so", "if", "then", "than", "too", "very", "just",
+            "now", "also", "all", "any", "some", "more", "most", "can", "could",
+            "should", "would", "will", "shall", "may", "might", "must", "do",
+            "does", "did", "done", "make", "made", "making", "get", "got",
+            "have", "has", "had", "need", "needs", "want", "wants", "like",
+            "please", "using", "use", "used", "here", "there", "when", "what",
+            "how", "why", "which", "who", "not", "no", "don", "doesn", "isn",
+            "still", "up", "out", "about", "set", "thing", "things", "stuff",
+            "after", "before", "again", "back", "currently", "recently",
+            "project", "projects", "folder", "folders", "file", "files",
+            "work", "version", "latest", "continue", "check", "checks",
+            "try", "tried", "let", "lets", "seems", "looks", "update",
+            "path", "paths", "name", "names", "value", "values", "string",
+            "line", "lines", "true", "false", "none", "null",
+        }
+    )
 
     def _derive_skill_name(self, task: str, executions: list[ToolExecution]) -> str:
-        text = f"{task} " + " ".join(execution.command() for execution in executions)
-        lowered = text.lower()
+        lowered = one_line(task, 400).lower()
         rules = [
             (("alembic", "migration", "prisma migrate", "flyway", "liquibase"), "database-migrations"),
-            (("pytest", "unittest", "python -m test"), "run-python-tests"),
-            (("playwright", "browser test", "e2e"), "browser-e2e-testing"),
+            (("pytest", "unittest", "python test", "run the tests"), "run-python-tests"),
+            (("playwright", "browser test", "end-to-end test"), "browser-e2e-testing"),
             (("docker compose", "docker-compose", "docker build"), "docker-compose-workflow"),
             (("cloudflare", "wrangler"), "deploy-cloudflare-pages"),
             (("vercel", "netlify"), "deploy-web-app"),
@@ -1311,9 +1513,69 @@ class TranscriptAnalyzer:
             (("npm install", "pnpm add", "yarn add"), "install-node-dependencies"),
             (("uv ", "pip install", "poetry add"), "manage-python-dependencies"),
         ]
+        # Name from what the *user asked for*. Scanning every command in a long
+        # session used to label a marketing video "browser-e2e-testing" just
+        # because it took screenshots once.
         for signals, name in rules:
             if any(signal in lowered for signal in signals):
                 return name
+        return self._fallback_skill_name(task, executions)
+
+    def _fallback_skill_name(
+        self,
+        task: str,
+        executions: list[ToolExecution],
+    ) -> str:
+        """Build a stable name for work the hard-coded rule list does not know.
+
+        Video editing, audio repair, MCP setup, and PowerShell work are the
+        common real tasks here; without a fallback they could never produce a
+        skill even when the procedure was verified.
+        """
+        family = self._workflow_family(executions)
+        family_stem = family.split("-")[-1] if family else ""
+        tokens: list[str] = []
+        for token in tokenize(strip_paths(task)):
+            if not token.isalpha() or len(token) < 3:
+                continue
+            if token in self._NAME_STOPWORDS:
+                continue
+            if family_stem and token.startswith(family_stem[:4]):
+                continue
+            if token not in tokens:
+                tokens.append(token)
+            if len(tokens) == 2:
+                break
+        if not tokens:
+            return ""
+        parts = ([family] if family else []) + tokens
+        name = "-".join(parts)[:56].strip("-")
+        while name and name.count("-") and len(name.rsplit("-", 1)[-1]) < 3:
+            name = name.rsplit("-", 1)[0]
+        name = re.sub(r"-{2,}", "-", name).strip("-")
+        if len(name) < 6 or name in {"workflow", "task", "project", "procedure"}:
+            return ""
+        return name
+
+    @staticmethod
+    def _workflow_family(executions: list[ToolExecution]) -> str:
+        text = " ".join(execution.command() for execution in executions).casefold()
+        if re.search(r"\b(hyperframes|remotion|gsap|blender)\b|\.mp4\b|\.mov\b", text):
+            return "edit-video"
+        if re.search(r"\b(ffmpeg|ffprobe|sox|whisper|voiceover|elevenlabs)\b|\.mp3\b|\.wav\b", text):
+            return "edit-audio"
+        if "wrangler" in text:
+            return "deploy-cloudflare"
+        if "playwright" in text:
+            return "browser-test"
+        if "pytest" in text or "unittest" in text:
+            return "run-python-tests"
+        if re.search(r"\b(npm|pnpm|yarn|node)\b", text):
+            return "run-node-task"
+        if re.search(r"\b(python|pip|uv)\b", text):
+            return "run-python-task"
+        if re.search(r"\b(Get-|Set-|New-Item|Remove-Item|Test-Path)\w*", text):
+            return "powershell"
         return ""
 
     def _trigger_keywords(
@@ -1323,23 +1585,30 @@ class TranscriptAnalyzer:
         workspace: str | Path | None,
     ) -> list[str]:
         keywords: list[str] = []
-        for token in tokenize(task):
-            if token not in keywords:
+
+        def _keep(token: str) -> bool:
+            return (
+                len(token) >= 3
+                and token.isalpha()
+                and token not in self._NAME_STOPWORDS
+            )
+
+        for token in tokenize(strip_paths(task)):
+            if _keep(token) and token not in keywords:
                 keywords.append(token)
         for execution in executions:
-            command = execution.command()
-            for token in tokenize(command):
-                if token not in keywords and token not in ("run", "command", "npx", "sudo"):
+            for token in tokenize(strip_paths(execution.command())):
+                if _keep(token) and token not in keywords and token not in ("run", "command", "npx", "sudo"):
                     keywords.append(token)
         for signal in detect_project_signals(workspace):
             if signal not in keywords:
                 keywords.append(signal)
         return keywords[:14]
 
-    @staticmethod
-    def _describe_workflow(task: str, name: str, keywords: list[str]) -> str:
+    @classmethod
+    def _describe_workflow(cls, task: str, name: str, keywords: list[str]) -> str:
         trigger = ", ".join(keywords[:8]) if keywords else name.replace("-", " ")
-        goal = truncate(task, 160).rstrip(".")
+        goal = short_goal(strip_paths(task), 140)
         description = (
             f"Use when the task involves {trigger}. "
             f"Repeatable, verified procedure for: {goal}."

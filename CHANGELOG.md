@@ -2,9 +2,30 @@
 
 All notable changes to Harness² are documented here.
 
-## Unreleased
+## 2.2.0 — 2026-10-26
 
 ### Added
+
+- `harness skills why`: replays recent sessions and reports, per task, whether a
+  workflow was found, its name and quality, and the first gate that blocked it.
+- Skill extraction now evaluates every actionable task in a session instead of
+  only the first prompt, and caps output at three workflows per session.
+
+### Fixed
+
+- Skills are no longer lost because a later, unrelated task ended the session
+  "partial": success is decided per task segment, after any verified recoveries.
+- The actionable-goal gate accepts real multi-sentence requests (up to 48 words)
+  while still rejecting questions and research prompts.
+- Non-code work (video/audio edits, MCP setup, PowerShell) gets a derived skill
+  name instead of being dropped by the fixed rule list.
+
+### Changed
+
+- Two tasks in one session can no longer overwrite each other's skill file; the
+  second workflow gets a distinct name.
+
+### Added (routing and isolation)
 
 - Project-aware task routing. Every new prompt, every completed `Stop` cycle, and
   `harness route "task"` select the project-local skills and tools that match the

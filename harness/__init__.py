@@ -8,6 +8,6 @@ The plugin turns verified session evidence into:
 * a searchable SQLite memory and a human-readable EXPERIENCE.md library.
 """
 
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 
 __all__ = ["__version__"]
