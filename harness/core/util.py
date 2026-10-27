@@ -23,6 +23,48 @@ def utc_iso() -> str:
     return utc_now().isoformat(timespec="seconds")
 
 
+_CHAT_PRONOMINAL_RE = re.compile(
+    r"\b(i|i'm|i've|i'd|my|mine|we|our|ours|him|her|his|hers|they|them|their)\b",
+    re.IGNORECASE,
+)
+_CHAT_VERBS = (
+    "want", "wanted", "need", "needed", "like", "liked", "love", "loved",
+    "feel", "feels", "felt", "sounds", "kinda", "maybe", "abit", "okay",
+)
+_CHAT_TRAILING = {
+    "and", "or", "because", "with", "to", "for", "the", "a", "an", "of",
+    "when", "also", "but", "so", "that", "it", "them",
+}
+
+
+def is_chatty_directive(text: str) -> bool:
+    """True for a chat sentence that merely contains "never" or "always".
+
+    Users write requirements in passing ("never want scenes to popping up out
+    of no where ... i need them to be high quality"). Turning those into
+    permanent rules filled AGENTS.md with first-person noise, so they are
+    rejected unless they read like an instruction.
+    """
+    clean = str(text or "").strip()
+    if not clean:
+        return True
+    if len(clean) > 180:
+        return True
+    if "\u2026" in clean or "..." in clean:
+        return True
+    lowered = clean.lower()
+    if "http://" in lowered or "https://" in lowered:
+        return True
+    if _CHAT_PRONOMINAL_RE.search(clean):
+        return True
+    words = lowered.rstrip(" .,-").split()
+    if words and words[-1] in _CHAT_TRAILING:
+        return True
+    padded = f" {lowered} "
+    return any(f" {verb} " in padded for verb in _CHAT_VERBS)
+
+
+
 def utc_date() -> str:
     return utc_now().strftime("%Y-%m-%d")
 

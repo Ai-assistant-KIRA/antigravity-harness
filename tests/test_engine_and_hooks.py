@@ -439,14 +439,17 @@ class TestHooks(IsolatedHarnessTestCase):
             self.assertFalse(candidates[0]["verified"])
 
     def test_stop_is_fail_safe(self) -> None:
-        with mock.patch("harness.hooks.HarnessEngine.run_cycle", side_effect=RuntimeError("boom")):
+        with mock.patch(
+            "harness.core.engine.HarnessEngine.run_cycle",
+            side_effect=RuntimeError("boom"),
+        ):
             result = handle_stop(self.payload())
         self.assertEqual(result, {"decision": "stop"})
         self.assertTrue((get_state_dir() / "hook_errors.log").exists())
 
     def test_session_start_is_fail_safe(self) -> None:
         with mock.patch(
-            "harness.hooks.SessionLoader.generate_session_start_payload",
+            "harness.core.loader.SessionLoader.generate_session_start_payload",
             side_effect=RuntimeError("boom"),
         ):
             result = handle_session_start(self.payload())

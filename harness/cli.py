@@ -738,6 +738,18 @@ def cmd_memory(args: argparse.Namespace) -> None:
             print(f"[+] Imported: {counts}")
         return
 
+    if action == "dedupe":
+        counts = store.dedupe_lessons(dry_run=bool(getattr(args, "dry_run", False)))
+        if args.json:
+            _echo(counts, True)
+        else:
+            prefix = "Would remove" if getattr(args, "dry_run", False) else "Removed"
+            print(
+                f"[+] {prefix} {counts['lessons_removed']} duplicate lesson(s) "
+                f"across {counts['duplicate_groups']} group(s)"
+            )
+        return
+
     if action == "prune":
         settings, _warnings = load_settings()
         counts = store.prune(
@@ -1371,7 +1383,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="stats",
         choices=[
             "stats", "status", "search", "find", "list", "show", "add", "edit",
-            "delete", "sync", "export", "import", "prune", "reset", "forget",
+            "delete", "sync", "export", "import", "dedupe", "prune", "reset", "forget",
         ],
     )
     p_memory.add_argument("terms", nargs="*", help="search terms, lesson id, or a positional export/import path")
@@ -1404,6 +1416,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_memory.add_argument("--days", type=int, default=None)
     p_memory.add_argument("--candidate-days", type=int, default=None)
     p_memory.add_argument("--replace", action="store_true", help="replace conflicting import rows")
+    p_memory.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report what dedupe would remove without deleting",
+    )
     p_memory.add_argument("--yes", "-y", action="store_true")
     p_memory.add_argument("--json", action="store_true")
     _add_workspace(p_memory)

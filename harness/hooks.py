@@ -25,15 +25,14 @@ from pathlib import Path
 from typing import Any
 
 from .core.config import (
+    bind_conversation_workspace,
+    get_bound_workspace,
     get_event_journal_path,
     get_hook_error_log_path,
     get_state_dir,
     safe_conversation_id,
 )
-from .core.engine import HarnessEngine
-from .core.loader import SessionLoader
 from .core.redaction import redact, redact_mapping
-from .core.retrieval import build_pre_invocation_payload
 from .core.util import (
     append_jsonl,
     atomic_write_text,
@@ -91,6 +90,21 @@ def _payload_workspace(payload: dict[str, Any]) -> Path | None:
         if path.exists() and path.is_dir():
             return path
     return None
+
+
+def _resolve_workspace(payload: dict[str, Any]) -> Path | None:
+    """Workspace for this hook call: payload first, then the conversation binding.
+
+    The process working directory is never used. Falling back to it attributes a
+    conversation to whatever folder the hook happened to run in, which is how
+    project lessons leaked into another project's ``AGENTS.md``.
+    """
+    workspace = _payload_workspace(payload)
+    conversation_id = _conversation_id(payload)
+    if workspace:
+        bind_conversation_workspace(conversation_id, workspace)
+        return workspace
+    return get_bound_workspace(conversation_id)
 
 
 def _conversation_id(payload: dict[str, Any]) -> str:
@@ -378,7 +392,11 @@ def handle_session_start(payload: dict[str, Any] | None = None) -> dict[str, Any
     payload = payload or {}
     _journal("SessionStart", payload)
     try:
-        workspace = _payload_workspace(payload)
+        # Imported lazily: SessionStart is rare, and the PostToolUse path must
+        # not pay for the loader, analyzer, and SQLite imports.
+        from .core.loader import SessionLoader
+
+        workspace = _resolve_workspace(payload)
         loader = SessionLoader(workspace)
         return loader.generate_session_start_payload(payload, workspace)
     except Exception as exc:
@@ -399,7 +417,7 @@ def handle_post_tool_use(payload: dict[str, Any] | None = None) -> dict[str, Any
         error = _tool_error(payload, tool_call) if tool_name else ""
         if error:
             conversation_id = _conversation_id(payload)
-            workspace = _payload_workspace(payload)
+            workspace = _resolve_workspace(payload)
             args = tool_call.get("arguments") or tool_call.get("args") or {}
             command = ""
             if isinstance(args, dict):
@@ -433,8 +451,10 @@ def handle_stop(payload: dict[str, Any] | None = None) -> dict[str, Any]:
     payload = payload or {}
     _journal("Stop", payload)
     try:
+        from .core.engine import HarnessEngine
+
         conversation_id = _conversation_id(payload)
-        workspace = _payload_workspace(payload)
+        workspace = _resolve_workspace(payload)
         transcript = _transcript_path(payload)
         pending = _pending_events(conversation_id, workspace)
         consumed_ids = {str(event.get("id")) for event in pending if event.get("id")}
@@ -477,9 +497,11 @@ def handle_pre_invocation(payload: dict[str, Any] | None = None) -> dict[str, An
             initial_steps = int(raw_steps)
         except (TypeError, ValueError):
             initial_steps = 0
+        from .core.retrieval import build_pre_invocation_payload
+
         output = build_pre_invocation_payload(
             conversation_id=_conversation_id(payload),
-            workspace=_payload_workspace(payload),
+            workspace=_resolve_workspace(payload),
             transcript_path=_transcript_path(payload),
             invocation_num=invocation,
             initial_num_steps=initial_steps,

@@ -45,6 +45,8 @@ from .util import file_lock, hash_steps, one_line, truncate
 
 MAX_SKILLS_PER_SESSION = 2
 MIN_WORKFLOW_QUALITY = 0.55
+MAX_DIRECTIVES_PER_CYCLE = 5
+_WINDOWS_PATH_RE = re.compile(r"[A-Za-z]:\\[^\s`\"'<>|)]+")
 
 
 def cycle_lock_path(workspace: Path | str | None) -> Path:
@@ -237,6 +239,22 @@ class HarnessEngine:
             result.summary = "No transcript steps were available; nothing was recorded."
             return result
 
+        if workspace and not self._steps_belong_to_workspace(steps, workspace):
+            # A conversation is analysed against one workspace. If the
+            # transcript is clearly from a different project, writing its
+            # lessons here would leak rules into the wrong AGENTS.md.
+            if incremental is not None:
+                incremental.save()
+            result.status = "skipped"
+            result.summary = (
+                "Transcript belongs to a different workspace; nothing was written."
+            )
+            self._add_warning(
+                result,
+                f"transcript/workspace mismatch: no lessons written for '{workspace}'",
+            )
+            return result
+
         content_hash = hash_steps(steps)
         resolved_id = safe_conversation_id(
             conversation_id
@@ -267,6 +285,8 @@ class HarnessEngine:
         result.unresolved_observations = len(analysis.unresolved_events)
 
         verified = self._probe_contrastive_events(analysis.contrastive_events)
+        if workspace and verified:
+            verified = self._drop_foreign_path_events(verified, workspace, result)
         workflows = self._probe_workflows(analysis.workflows)
         result.verified_lessons = len(verified)
 
@@ -297,7 +317,7 @@ class HarnessEngine:
             try:
                 details = self.agents_manager.update_rules(
                     contrastive_events=verified,
-                    user_constraints=analysis.user_constraints,
+                    user_constraints=analysis.user_constraints[:MAX_DIRECTIVES_PER_CYCLE],
                     environment_quirks=analysis.environment_quirks,
                     target=target,
                     on_apply=_record_rule_application,
@@ -424,6 +444,79 @@ class HarnessEngine:
         if not path.is_absolute():
             path = Path.cwd() / path
         return path.resolve()
+
+    @staticmethod
+    def _root_prefix(workspace: Path | str) -> str:
+        return str(Path(workspace).resolve()).lower().replace("/", "\\").rstrip("\\")
+
+    def _steps_belong_to_workspace(
+        self,
+        steps: Sequence[Any],
+        workspace: Path | str,
+    ) -> bool:
+        """Cheap affinity check: does this transcript talk about this project?
+
+        Transcripts with no absolute paths are allowed. Once an absolute path
+        appears, at least one must live under the workspace; otherwise the
+        transcript belongs to another project.
+        """
+        root = self._root_prefix(workspace)
+        inside = 0
+        outside = 0
+        seen: set[str] = set()
+        for step in list(steps)[:250]:
+            text = (
+                json.dumps(step, ensure_ascii=False)
+                if isinstance(step, dict)
+                else str(step)
+            )
+            for match in _WINDOWS_PATH_RE.findall(text):
+                normalized = re.sub(r"\\+", r"\\", match).lower()
+                key = normalized[:200]
+                if key in seen:
+                    continue
+                seen.add(key)
+                if key.startswith(root):
+                    inside += 1
+                else:
+                    outside += 1
+        if outside == 0:
+            return True
+        return inside > 0
+
+    def _drop_foreign_path_events(
+        self,
+        events: Sequence[ContrastiveEvent],
+        workspace: Path | str,
+        result: EngineResult,
+    ) -> list[ContrastiveEvent]:
+        """Reject lessons whose evidence points at another project's files."""
+        root = self._root_prefix(workspace)
+        kept: list[ContrastiveEvent] = []
+        for event in events:
+            text = " ".join(
+                str(value)
+                for value in (
+                    event.error_message,
+                    event.resolution_summary,
+                    event.failed_args,
+                    event.successful_args,
+                )
+            )
+            foreign = [
+                match
+                for match in _WINDOWS_PATH_RE.findall(text)
+                if not re.sub(r"\\+", r"\\", match).lower().startswith(root)
+            ]
+            if foreign:
+                self._add_warning(
+                    result,
+                    "dropped lesson that references another project's path: "
+                    + one_line(foreign[0], 80),
+                )
+                continue
+            kept.append(event)
+        return kept
 
     def _bind_workspace(self, workspace: Path | None) -> None:
         """Keep every helper consistent with a per-call workspace override."""

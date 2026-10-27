@@ -25,6 +25,7 @@ from .config import get_plugin_dir, get_plugin_rules_path, get_workspace_rules_p
 from .redaction import contains_secret, redact
 from .util import (
     atomic_write_text,
+    is_chatty_directive,
     jaccard,
     normalize_for_compare,
     one_line,
@@ -304,6 +305,8 @@ def _is_standing_directive(text: str) -> bool:
     if not clean or len(clean) < 10 or len(clean) > 240:
         return False
     if "?" in clean:
+        return False
+    if is_chatty_directive(clean):
         return False
     if _is_self_referential(clean):
         return False
@@ -1152,6 +1155,7 @@ class AgentsMdManager:
                 for rule in block_rules.pitfalls
                 if not _is_self_referential(rule)
                 and not _is_non_causal_recovery(rule)
+                and (not is_workspace or not self._mentions_foreign_path(rule))
             )
             parsed.routing.extend(
                 item for item in block_rules.routing if _clean_routing_item(item)
@@ -1395,3 +1399,14 @@ class AgentsMdManager:
     @staticmethod
     def _normalize_file(text: str) -> str:
         return (text or "").replace("\r\n", "\n").strip()
+
+    def _mentions_foreign_path(self, text: str) -> bool:
+        """True when a rule cites an absolute path outside this workspace."""
+        if not self.workspace_path:
+            return False
+        root = str(Path(self.workspace_path).resolve()).lower().replace("/", "\\").rstrip("\\")
+        for match in re.findall(r"[A-Za-z]:\\[^\s`\"'<>|)]+", text or ""):
+            normalized = re.sub(r"\\+", r"\\", match).lower()
+            if not normalized.startswith(root):
+                return True
+        return False

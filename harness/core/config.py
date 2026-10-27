@@ -194,6 +194,56 @@ def get_event_journal_path() -> Path:
     return get_state_dir() / "events.jsonl"
 
 
+def get_conversation_workspace_path(conversation_id: str | None) -> Path:
+    """State file that remembers which workspace a conversation belongs to."""
+    cid = safe_conversation_id(conversation_id or "")
+    if not cid:
+        return get_state_dir() / "conversations" / "unbound.json"
+    return get_state_dir() / "conversations" / f"{cid}.json"
+
+
+def get_bound_workspace(conversation_id: str | None) -> Path | None:
+    """Return the workspace remembered for this conversation, if any.
+
+    Antigravity normally sends ``workspacePaths`` on every hook payload. Some
+    integrations omit it, and falling back to the process working directory is
+    how another project's lessons ended up in the wrong ``AGENTS.md``. A
+    conversation keeps the workspace it was first seen with instead.
+    """
+    path = get_conversation_workspace_path(conversation_id)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    value = str(data.get("workspace") or "").strip()
+    if not value:
+        return None
+    candidate = Path(value).expanduser()
+    if not candidate.is_absolute() or not candidate.is_dir():
+        return None
+    return candidate
+
+
+def bind_conversation_workspace(conversation_id: str | None, workspace: Path | str | None) -> None:
+    """Persist the conversation-to-workspace mapping (best effort)."""
+    cid = safe_conversation_id(conversation_id or "")
+    if not cid or not workspace:
+        return
+    path = Path(workspace).expanduser()
+    if not path.is_absolute() or not path.is_dir():
+        return
+    target = get_conversation_workspace_path(cid)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"conversation_id": cid, "workspace": str(path.resolve())}
+        text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+        tmp = target.with_name(target.name + ".tmp")
+        tmp.write_text(text, encoding="utf-8")
+        tmp.replace(target)
+    except OSError:
+        pass
+
+
 def get_workspace_rules_path(workspace_root: Path | None = None) -> Path:
     root = Path(workspace_root).expanduser() if workspace_root else Path.cwd()
     return root / "AGENTS.md"

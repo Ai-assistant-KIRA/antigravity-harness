@@ -2491,6 +2491,43 @@ class MemoryStore:
         return imported
 
     # -------------------------------------------------------------------- pruning
+    def dedupe_lessons(self, dry_run: bool = False) -> dict[str, int]:
+        """Collapse lessons that repeat the same failure inside one workspace.
+
+        Long sessions used to store the same error pattern several times (one
+        row per conversation). Keep the strongest row and drop the rest.
+        """
+        counts = {"duplicate_groups": 0, "lessons_removed": 0}
+        with self._connect() as conn:
+            rows = list(
+                conn.execute(
+                    "SELECT workspace, error_pattern, COUNT(*) AS n "
+                    "FROM lessons GROUP BY workspace, error_pattern HAVING n > 1"
+                )
+            )
+            counts["duplicate_groups"] = len(rows)
+            for workspace, pattern, _count in rows:
+                ids = [
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT id FROM lessons WHERE workspace = ? AND error_pattern = ? "
+                        "ORDER BY verified DESC, confidence DESC, surfaced_count DESC, "
+                        "occurrences DESC, id ASC",
+                        (workspace, pattern),
+                    )
+                ]
+                if len(ids) < 2:
+                    continue
+                counts["lessons_removed"] += len(ids) - 1
+                if dry_run:
+                    continue
+                placeholders = ",".join("?" for _ in ids[1:])
+                conn.execute(
+                    f"DELETE FROM lessons WHERE id IN ({placeholders})",
+                    ids[1:],
+                )
+        return counts
+
     def prune(
         self,
         max_lessons: int = 2000,

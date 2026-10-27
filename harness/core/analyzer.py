@@ -23,7 +23,15 @@ from typing import Any
 
 from .config import detect_project_signals, get_plugin_dir, tokenize
 from .redaction import redact
-from .util import jaccard, normalize_for_compare, one_line, short_goal, strip_paths, truncate
+from .util import (
+    is_chatty_directive,
+    jaccard,
+    normalize_for_compare,
+    one_line,
+    short_goal,
+    strip_paths,
+    truncate,
+)
 
 # A session can grow for hours. Bound the Stop-hook work so a pathological
 # transcript cannot exhaust memory or exceed the host's hook timeout.
@@ -1174,7 +1182,9 @@ class TranscriptAnalyzer:
             "worry about license", "private use", "be nice", "do your best",
             "keep going", "continue", "thanks", "thank you",
         )
-        return any(item in lowered for item in noise)
+        if any(item in lowered for item in noise):
+            return True
+        return is_chatty_directive(text)
 
     # ----------------------------------------------------------------- workflows
     def _extract_procedural_workflows(
