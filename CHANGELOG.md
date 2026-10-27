@@ -2,6 +2,30 @@
 
 All notable changes to Harness² are documented here.
 
+## Unreleased
+
+### Added
+
+- `harness memory dedupe [--dry-run]`: collapses lessons that repeat the same
+  failure inside one workspace, keeping the most evidenced row.
+- Conversations are bound to the workspace they were first seen in
+  (`state/conversations/<id>.json`), so a hook payload without `workspacePaths`
+  reuses the real project instead of the process working directory.
+
+### Fixed
+
+- **Cross-project leak.** A transcript from one project could be analysed
+  against another folder and write its rules and skills there. The cycle now
+  skips transcripts whose absolute paths belong to a different workspace, drops
+  lessons that cite foreign paths, and repairs existing pitfalls that do.
+- Chatty first-person requirements ("never want scenes to pop up … I need them
+  high quality") no longer become standing directives, at extraction, at
+  promotion, and during `harness rules sanitize`.
+- No workspace means memory and global environment rules only: project rules,
+  skills, and routing are never written to an unpinned working directory.
+- PostToolUse no longer imports the engine, loader, or retrieval modules at
+  module load: measured hook latency dropped from ~250 ms to ~120 ms on Windows.
+
 ## 2.2.0 — 2026-10-26
 
 ### Added
