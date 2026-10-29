@@ -8,9 +8,13 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
-    name: ${{ matrix.os }} / Python ${{ matrix.python-version }}
+    name: test / ${{ matrix.os }} / Python ${{ matrix.python-version }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -44,4 +48,88 @@ jobs:
         run: python scripts/stress_test.py --quick
 
       - name: Compile all sources
-        run: python -m compileall -q harness scripts
+        run: python -m compileall -q harness scripts install_plugin.py
+
+  lint-scripts:
+    name: lint shell launchers
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: ShellCheck
+        run: shellcheck --severity=warning install.sh bin/hook bin/harness
+
+  # The install path a user gets when they paste the repository link into
+  # Antigravity: the bootstrap script, run from a checkout and piped from the
+  # web, followed by the installed doctor.
+  install:
+    name: install / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Bootstrap from the checkout (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $target = Join-Path $env:RUNNER_TEMP 'checkout\harness'
+          $output = powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1 --target $target
+          $output
+          if ($LASTEXITCODE -ne 0) { throw "install.ps1 exited $LASTEXITCODE" }
+          if (-not (@($output)[-1] -like 'HARNESS_INSTALL: ok*')) { throw 'missing ok status line' }
+          & "$target\bin\harness.cmd" doctor
+          if ($LASTEXITCODE -ne 0) { throw "doctor exited $LASTEXITCODE" }
+
+      - name: Bootstrap piped from the web (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          HARNESS_SOURCE_URL: https://github.com/${{ github.repository }}/archive/${{ github.sha }}.zip
+        run: |
+          $target = Join-Path $env:RUNNER_TEMP 'web\harness'
+          $env:HARNESS_INSTALL_ARGS = "--target $target"
+          $output = powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-Content -Raw install.ps1 | iex"
+          $output
+          if ($LASTEXITCODE -ne 0) { throw "piped install exited $LASTEXITCODE" }
+          if (-not (@($output)[-1] -like 'HARNESS_INSTALL: ok*')) { throw 'missing ok status line' }
+
+      - name: Bootstrap from the checkout (POSIX)
+        if: runner.os != 'Windows'
+        run: |
+          target="$RUNNER_TEMP/checkout/harness"
+          sh install.sh --target "$target" | tee install.log
+          tail -n 1 install.log | grep -q '^HARNESS_INSTALL: ok'
+          "$target/bin/harness" doctor
+
+      - name: Bootstrap piped from the web (POSIX)
+        if: runner.os != 'Windows'
+        env:
+          HARNESS_SOURCE_URL: https://github.com/${{ github.repository }}/archive/${{ github.sha }}.tar.gz
+        run: |
+          target="$RUNNER_TEMP/web/harness"
+          sh -s -- --target "$target" < install.sh | tee install-web.log
+          tail -n 1 install-web.log | grep -q '^HARNESS_INSTALL: ok'
+
+      - name: Upgrade in place keeps working
+        if: runner.os != 'Windows'
+        run: |
+          target="$RUNNER_TEMP/checkout/harness"
+          sh install.sh --target "$target" | tail -n 1 | grep -q '^HARNESS_INSTALL: ok'
+          test -n "$(ls -A "$RUNNER_TEMP/checkout/.harness-backups")"

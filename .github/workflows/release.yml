@@ -1,0 +1,71 @@
+name: Release
+
+# Push a tag such as v2.3.0 to publish a GitHub release. The tag must match
+# the version in plugin.json, pyproject.toml, and harness/__init__.py, and the
+# release notes are the matching CHANGELOG.md section.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Verify the tag matches the version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          python - "$version" <<'PY'
+          import json, re, sys
+          from pathlib import Path
+          want = sys.argv[1]
+          found = {
+              "plugin.json": json.loads(Path("plugin.json").read_text(encoding="utf-8"))["version"],
+              "pyproject.toml": re.search(r'(?m)^version\s*=\s*"([^"]+)"', Path("pyproject.toml").read_text(encoding="utf-8")).group(1),
+              "harness/__init__.py": re.search(r'__version__\s*=\s*"([^"]+)"', Path("harness/__init__.py").read_text(encoding="utf-8")).group(1),
+          }
+          bad = {name: value for name, value in found.items() if value != want}
+          if bad:
+              sys.exit(f"tag v{want} does not match: {bad}")
+          PY
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests
+
+      - name: Extract release notes
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '
+            $0 ~ "^## " v "([^0-9.]|$)" { keep = 1; next }
+            keep && /^## / { exit }
+            keep { print }
+          ' CHANGELOG.md > notes.md
+          test -s notes.md || { echo "no CHANGELOG.md section for $version"; exit 1; }
+
+      - name: Build the plugin archive
+        run: |
+          name="antigravity-harness-${GITHUB_REF_NAME}"
+          git archive --format=zip --prefix="$name/" -o "$name.zip" "$GITHUB_REF_NAME"
+          git archive --format=tar.gz --prefix="$name/" -o "$name.tar.gz" "$GITHUB_REF_NAME"
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "Harness² ${GITHUB_REF_NAME}" \
+            --notes-file notes.md \
+            "antigravity-harness-${GITHUB_REF_NAME}.zip" \
+            "antigravity-harness-${GITHUB_REF_NAME}.tar.gz"
