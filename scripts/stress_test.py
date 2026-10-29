@@ -45,7 +45,24 @@ from harness.core.agents_md_manager import (
     RuleSet,
 )
 
+from harness.core.config import project_fingerprint
+
 RUNNER = CHECKOUT / "scripts" / "hook_runner.py"
+
+
+def _memory_db(ctx: "StressContext", workspace: Path) -> Path:
+    """Where a workspace session is stored.
+
+    Project isolation is on by default, so sessions with a workspace land in
+    ``memory/projects/<fingerprint>/``; the global database only holds sessions
+    without one (or everything when isolation is disabled).
+    """
+    project_db = (
+        ctx.plugin_dir / "memory" / "projects" / project_fingerprint(workspace) / "harness_memory.db"
+    )
+    if project_db.exists():
+        return project_db
+    return ctx.plugin_dir / "memory" / "harness_memory.db"
 
 
 @dataclass
@@ -398,7 +415,7 @@ def scenario_stop_concurrency(
             f"expected {count} processed Stop cycles, got {statuses}"
         )
 
-    db_path = ctx.plugin_dir / "memory" / "harness_memory.db"
+    db_path = _memory_db(ctx, ctx.workspace)
     if not db_path.exists():
         raise AssertionError("memory database was not created")
     conn = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True, timeout=10)
@@ -626,7 +643,7 @@ def scenario_large_transcript(
     if not expect_truncation and warnings:
         raise AssertionError(f"unexpected warning for a bounded transcript: {warnings!r}")
 
-    db_path = ctx.plugin_dir / "memory" / "harness_memory.db"
+    db_path = _memory_db(ctx, workspace)
     conn = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True, timeout=10)
     try:
         session = conn.execute(
