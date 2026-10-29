@@ -73,8 +73,12 @@ function Install-Harness {
         [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
         $previousProgress = $ProgressPreference
         $ProgressPreference = 'SilentlyContinue'
-        try { Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing } finally { $ProgressPreference = $previousProgress }
-        Expand-Archive -Path $zip -DestinationPath $cleanup -Force
+        # Progress bars print tens of KB into a non-interactive console, which
+        # can push the final status line out of an agent's view.
+        try {
+            Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+            Expand-Archive -Path $zip -DestinationPath $cleanup -Force
+        } finally { $ProgressPreference = $previousProgress }
         $found = Get-ChildItem -Path $cleanup -Filter 'install_plugin.py' -Recurse -Depth 2 | Select-Object -First 1
         if (-not $found) { throw "the downloaded archive does not contain install_plugin.py ($url)" }
         $source = $found.Directory.FullName
