@@ -4,15 +4,96 @@ All notable changes to Harness² are documented here.
 
 ## Unreleased
 
+## 2.3.0 — 2026-10-29
+
+Upgrade with `python install_plugin.py` (or the one-line installers below). The
+installer keeps memory, rules, and skills, and removes transcript cursors that
+older versions stored unredacted. After upgrading, run `harness privacy scrub`
+in each project to redact any credential an older version wrote into a
+generated skill, and rotate that credential.
+
+### Install
+
+- **One-line installers.** `install.ps1` (Windows) and `install.sh`
+  (macOS/Linux) find Python 3.10+ (skipping the Microsoft Store alias),
+  download the source when not run from a checkout, and run the installer.
+  Both work piped from the web (`irm … | iex`, `curl … | sh`).
+- Every installer run ends with one machine-readable line,
+  `HARNESS_INSTALL: ok …` or `HARNESS_INSTALL: failed reason=…`, so an agent
+  driving the install can verify the result.
+- The installer runs `harness doctor` after the smoke test. Critical checks
+  fail the install; everything else is reported as a note.
+- Launchers get the line endings their shell needs, whatever the checkout
+  produced, and `.gitattributes` pins them in the repository.
+- `bin/harness.cmd` and `bin/harness` use the recorded interpreter too, so the
+  CLI works on machines that only have the `py` launcher.
+- Running the installer with the checkout itself as the target explains how to
+  fix it instead of only refusing.
+- `pyproject.toml`, `plugin.json`, and `harness.__version__` agree (the
+  package metadata still said 2.1.0); a test keeps them in sync.
+
+### Fixed (performance audit, October 2026)
+
+- **Learning stopped in any workspace whose folder name has a space.** The
+  transcript/workspace check cut paths at the first space, so
+  `…\video editor\…` never matched its own workspace and every Stop since the
+  scope fix was skipped. Paths are now matched at their position in the raw
+  text, JSON escapes such as `task:\n` are no longer read as drive letters, and
+  tool or agent folders (Program Files, AppData, `~/.gemini`) do not count as
+  another project.
+- **Credentials reached project files.** Redaction now covers
+  `SetEnvironmentVariable("X_API_KEY", "…")`, `setx X_API_KEY …`, `--key …`,
+  and `sk_…` keys. Generated skills, managed rules, and routing lines also pass
+  a strict filter for bare high-entropy tokens. Transcript cursors store
+  redacted, size-bounded steps (format v2); older cursors are discarded.
+- **"Verified fixes" that were not fixes.** A different script of the same
+  program (`python a.py` → `python b.py`) or a different subcommand
+  (`hyperframes check` → `hyperframes render`) only counts as a fix after a
+  usage error. Status lines such as `1/1 ready, 0 failed` are not errors, a
+  rerun after file edits is not a "transient" lesson, inline one-liners are
+  never recommended as a fix, and host markup (`</SYSTEM_MESSAGE>`) is ignored.
+- Stored rules are re-checked on every update and by `rules repair`, so blocks
+  written by older versions are cleaned without manual edits. Recall and
+  briefings skip stored lessons that fail the current gates.
+- PowerShell quoting failures of inline `python -c` / `node -e` /
+  `powershell -Command` code become one class rule instead of one rule per
+  command, and the rule is skipped when the user's own section already says it.
+- One-off instructions ("never re render it from scratch") are no longer
+  promoted to standing directives.
+- Skill names, titles, and descriptions come from what the procedure did, not
+  the first words of the prompt; probes and inline one-liners are left out of
+  procedures; quality is capped without a verification step.
+- Generated skills surfaced 10 times with no reuse are retired from briefings,
+  recall, and routing (the files stay on disk).
+- Routing requires real overlap with the request, routes for the newest
+  request, strips paths and credentials from the task line, and no longer
+  routes `run_extension` to every plugin or editor task.
+- `Stop:result` journal entries keep their conversation id when a cycle is
+  skipped.
+
+### Performance
+
+- Successful PostToolUse calls are answered before Harness is imported and are
+  no longer journaled. The Windows launcher uses the interpreter recorded at
+  install time (`bin/python.path`) instead of `where py` and the `py.exe` hop.
+  Measured per tool call through `cmd /c bin\hook.cmd`: 245 ms → 118 ms.
+- Transcript cursors are written as compact JSON with bounded strings.
+
 ### Added
 
+- `harness doctor` reports a `learning` check (Stop cycles that all skip or
+  never process) and a `secrets` check (credentials in generated skills,
+  managed rules, or old cursors), and names invalid skills.
+- `harness privacy scrub [--dry-run]` redacts Harness-generated skills,
+  re-sanitizes managed rule blocks, and rewrites old transcript cursors. The
+  installer runs the cursor part automatically on upgrade.
 - `harness memory dedupe [--dry-run]`: collapses lessons that repeat the same
   failure inside one workspace, keeping the most evidenced row.
 - Conversations are bound to the workspace they were first seen in
   (`state/conversations/<id>.json`), so a hook payload without `workspacePaths`
   reuses the real project instead of the process working directory.
 
-### Fixed
+### Fixed (scope and hook cost)
 
 - **Cross-project leak.** A transcript from one project could be analysed
   against another folder and write its rules and skills there. The cycle now
@@ -24,7 +105,8 @@ All notable changes to Harness² are documented here.
 - No workspace means memory and global environment rules only: project rules,
   skills, and routing are never written to an unpinned working directory.
 - PostToolUse no longer imports the engine, loader, or retrieval modules at
-  module load: measured hook latency dropped from ~250 ms to ~120 ms on Windows.
+  module load (measured in-process; the end-to-end launcher numbers are in
+  Performance above).
 
 ## 2.2.0 — 2026-10-26
 
