@@ -23,6 +23,10 @@ python scripts/stress_test.py --quick
 python install_plugin.py --dry-run
 ```
 
+The one-line installers (`install.ps1`, `install.sh`) install whatever is on
+`main`, so `main` must always be installable. Change their behavior together
+and keep the final `HARNESS_INSTALL:` status line: agents rely on it.
+
 The tests set `HARNESS_PLUGIN_DIR` and `HARNESS_GEMINI_CONFIG_DIR` to temporary
 directories. They must never touch your real plugin memory or rules.
 
@@ -119,13 +123,22 @@ Document the one-prompt Antigravity install
 Maintainers:
 
 1. Update the version in `harness/__init__.py`, `pyproject.toml`, and
-   `plugin.json`.
-2. Move the changelog entries into a dated release section.
+   `plugin.json`. `tests/test_release.py` fails if they disagree.
+2. Move the changelog entries into a dated `## X.Y.Z — YYYY-MM-DD` section.
 3. Run the unit tests, the stress test, and a clean install into a temporary
-   target.
-4. Commit, tag `vX.Y.Z`, and publish a GitHub release.
-5. Upload `assets/social-preview.png` in the repository settings if the card
+   target (`python install_plugin.py --target <temp dir>`; the last line must
+   be `HARNESS_INSTALL: ok`).
+4. Push to `main` and wait for CI. The `install` jobs run the bootstrap
+   scripts on Windows, macOS, and Linux, from a checkout and piped from the
+   web.
+5. Tag `vX.Y.Z` and push the tag. The release workflow checks the tag against
+   the version files, runs the tests, and publishes the release with the
+   matching CHANGELOG section and source archives.
+6. Upload `assets/social-preview.png` in the repository settings if the card
    changed.
+
+The one-line installers always install `main`. To install a release instead,
+set `HARNESS_SOURCE_URL` to that release's archive.
 
 ## License
 

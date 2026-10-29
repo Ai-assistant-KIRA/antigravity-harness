@@ -14,34 +14,46 @@ The plugin has no third-party Python dependencies.
 
 ## Option 1: Ask Antigravity to install it
 
-Open a new Antigravity conversation and paste this:
+Paste this into a new Antigravity conversation:
 
-> Install the Antigravity plugin from
-> https://github.com/Ai-assistant-KIRA/antigravity-harness.
->
-> Clone the repository to a temporary folder and read `INSTALL.md`.
-> Run `python install_plugin.py --dry-run` first, then run
-> `python install_plugin.py`.
-> Do not use `--reset` or `--force`. Keep the existing memory and rules.
-> When it finishes, run `harness doctor` from the installed plugin and show me
-> the result. Then tell me to restart Antigravity.
+> Install this Antigravity plugin: https://github.com/Ai-assistant-KIRA/antigravity-harness
 
-If the agent cannot clone, give it this ZIP URL instead:
+The agent follows the "For AI agents" steps in the README:
 
-```text
-https://github.com/Ai-assistant-KIRA/antigravity-harness/archive/refs/heads/main.zip
-```
+1. It runs one installer command for your OS. No clone is needed.
 
-### What the agent should do
+   ```powershell
+   # Windows
+   powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/Ai-assistant-KIRA/antigravity-harness/main/install.ps1 | iex"
+   ```
 
-1. Clone or download the repository to a temporary directory.
-2. Run `python install_plugin.py --dry-run` and check the target path.
-3. Run `python install_plugin.py` without `--reset`.
-4. Run the installed `doctor` command.
-5. Tell you to restart Antigravity.
+   ```bash
+   # macOS / Linux
+   curl -fsSL https://raw.githubusercontent.com/Ai-assistant-KIRA/antigravity-harness/main/install.sh | sh
+   ```
 
-The installer makes a backup before changing anything. It keeps `memory/`,
-`state/`, generated skills, and the global rules file on a normal upgrade.
+2. It checks the last output line: `HARNESS_INSTALL: ok …` or
+   `HARNESS_INSTALL: failed reason=…`.
+3. It tells you to restart Antigravity.
+
+The bootstrap scripts find Python 3.10+ (they skip the Microsoft Store
+`python` alias), download the source archive when they are not run from a
+checkout, and run `install_plugin.py`. That installer backs up the current
+plugin, keeps `memory/`, `state/`, generated skills, and the global rules file,
+smoke-tests the Stop hook, and runs `harness doctor`.
+
+Optional overrides:
+
+| Variable | Meaning |
+| :--- | :--- |
+| `HARNESS_PYTHON` | Interpreter to use instead of the auto-detected one |
+| `HARNESS_SOURCE_URL` | Archive to install from (ZIP for `install.ps1`, tar.gz for `install.sh`), for example a release tag |
+| `HARNESS_INSTALL_ARGS` | Extra installer arguments when `install.ps1` is piped through `iex`, for example `--dry-run` |
+
+Do not copy the repository into `~/.gemini/config/plugins/` by hand. The
+installer rewrites `hooks.json` to use the bundled launcher for your OS and
+records the interpreter; a raw copy depends on a `python` command being on
+`PATH` inside Antigravity.
 
 ## Option 2: Manual install
 
@@ -87,7 +99,10 @@ Restart Antigravity after the installer finishes. Then run:
 ```
 
 `doctor` checks the manifest, hooks, hook runner, memory database, FTS search,
-skills, rules file, and wrappers. It should end with `All checks passed.`
+skills, learning health, leaked secrets, rules file, and wrappers. It should
+end with `All checks passed.` The installer already ran it once; a `learning`
+failure right after an upgrade from 2.2 reflects history from the older version
+and clears after the next processed session.
 
 A healthy install has four hook events:
 
@@ -98,7 +113,8 @@ A healthy install has four hook events:
 
 ## Upgrade
 
-Run the same installer again from a fresh checkout. The default path is safe:
+Run the same one-line installer again, or the installer from a fresh checkout.
+The default path is safe:
 
 ```powershell
 python install_plugin.py
@@ -106,6 +122,10 @@ python install_plugin.py
 
 It backs up the current plugin, refreshes bundled code and skills, and keeps your
 memory, state, rules, and user-authored skills.
+
+Upgrading from 2.2 or earlier: those versions could write a credential into a
+generated skill. Run `harness privacy scrub` in each project you used with
+Harness, then rotate any key it reports.
 
 Do **not** use `--reset` unless you want to erase learned data and generated
 skills. `--reset` still makes a backup first.
@@ -192,6 +212,22 @@ Environment variables:
 | `HARNESS_DEBUG` | unset | Show tracebacks from the CLI |
 
 ## Troubleshooting
+
+### The installer cannot find Python
+
+Install Python 3.10 or newer, open a new terminal so `PATH` is refreshed, and
+run the installer again:
+
+```powershell
+winget install -e --id Python.Python.3.12
+```
+
+```bash
+brew install python@3.12        # macOS
+sudo apt install python3        # Debian/Ubuntu (3.10+ on 22.04 and later)
+```
+
+To force a specific interpreter, set `HARNESS_PYTHON` to its full path.
 
 ### `harness` is not found
 

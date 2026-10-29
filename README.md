@@ -45,16 +45,49 @@ That one rule keeps the harness useful:
 
 ### Ask Antigravity to install it
 
-Create a new Antigravity conversation and paste this:
+Paste this into a new Antigravity conversation:
 
-> Install the Antigravity plugin from
-> https://github.com/Ai-assistant-KIRA/antigravity-harness. Clone the repository
-> to a temporary folder, read `INSTALL.md`, run `python install_plugin.py
-> --dry-run`, then run `python install_plugin.py`. Do not use `--reset`. Run
-> `harness doctor` when it finishes, then tell me to restart Antigravity.
+> Install this Antigravity plugin: https://github.com/Ai-assistant-KIRA/antigravity-harness
 
-The installer backs up an existing install, keeps your memory and rules, and
-smoke-tests the Stop hook before it reports success.
+That is enough. The agent finds the steps below, runs one installer command,
+checks the result, and tells you to restart Antigravity. Requirements: Python
+3.10+ (the installer tells you how to get it if it is missing). Git is not
+needed.
+
+### For AI agents: install procedure
+
+Follow these steps exactly. Do not copy or clone the repository into the
+plugins folder yourself: the installer adapts the hooks to this machine, and a
+raw copy does not.
+
+1. Run the installer for the user's OS. It needs no clone.
+
+   Windows:
+
+   ```powershell
+   powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/Ai-assistant-KIRA/antigravity-harness/main/install.ps1 | iex"
+   ```
+
+   macOS / Linux:
+
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/Ai-assistant-KIRA/antigravity-harness/main/install.sh | sh
+   ```
+
+   If you already cloned the repository, run `install.ps1` or `sh install.sh`
+   from the clone instead. Do not pass `--reset` or `--force`.
+2. Read the **last line** of the output.
+   - `HARNESS_INSTALL: ok ...`: the plugin is installed, smoke-tested, and
+     passed `harness doctor`. Lines starting with `note:` are informational.
+   - `HARNESS_INSTALL: failed reason=...`: report the reason. If Python 3.10+
+     is missing, offer to install it (`winget install -e --id
+     Python.Python.3.12` on Windows, `brew install python@3.12` on macOS), then
+     run step 1 again in a new terminal.
+3. Tell the user to quit Antigravity completely and reopen it. Plugins and
+   hooks load at startup.
+
+Re-running the same command upgrades in place. The installer backs up the
+current install first and keeps memory, rules, and skills.
 
 ### Manual install
 
@@ -195,7 +228,8 @@ macOS/Linux use `bin/harness`.
 | `harness rules why "rule text"` | Show evidence and provenance for a rule |
 | `harness rules conflicts` | Find opposing managed rules |
 | `harness privacy audit` | Review retained data without dumping content |
-| `harness doctor` | Read-only deployment and data health check |
+| `harness privacy scrub` | Redact credentials from generated skills, managed rules, and stored cursors |
+| `harness doctor` | Read-only deployment and data health check, including stalled learning and leaked secrets |
 
 ## Configuration
 
@@ -244,11 +278,12 @@ Environment variables are documented in [INSTALL.md](INSTALL.md#configuration).
 antigravity-harness/
 ├── plugin.json              # Antigravity plugin manifest
 ├── hooks.json               # SessionStart, PreInvocation, PostToolUse, Stop
+├── install.ps1 / install.sh # One-line bootstrap: find Python, fetch, install
 ├── install_plugin.py        # Install, upgrade, uninstall, rollback
 ├── harness/
 │   ├── cli.py
 │   ├── hooks.py
-│   └── core/                # Analyzer, memory, rules, skills, trust, settings
+│   └── core/                # Analyzer, recovery rules, memory, rules, skills, trust, settings
 ├── scripts/
 │   ├── hook_runner.py
 │   ├── harness_cli.py
