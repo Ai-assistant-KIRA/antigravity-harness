@@ -25,11 +25,15 @@ from typing import Any
 
 from .analyzer import TranscriptAnalyzer
 from .config import get_state_dir, safe_conversation_id
+from .redaction import redact_mapping
 from .util import atomic_write_text, file_lock, utc_iso
 
-CURSOR_VERSION = 1
+# Version 2 stores redacted, size-bounded steps. Version 1 cursors held raw
+# transcript steps and are discarded on load.
+CURSOR_VERSION = 2
 CONTEXT_LIMIT_STEPS = 400
 CONTEXT_LIMIT_BYTES = 2_000_000
+STEP_STRING_LIMIT = 2_000
 HEAD_BYTES = 65536
 TAIL_BYTES = 4096
 
@@ -186,9 +190,9 @@ def save_cursor(read: IncrementalRead) -> bool:
     cursor.updated_at = utc_iso()
     try:
         state_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps(
-            cursor.to_dict(), ensure_ascii=False, indent=2, default=str
-        ) + "\n"
+        # Compact JSON: cursors are rewritten on every Stop, and indentation
+        # roughly doubled their size.
+        payload = json.dumps(cursor.to_dict(), ensure_ascii=False, default=str) + "\n"
         with file_lock(_lock_path(state_path), timeout=5.0, stale_after=30.0) as acquired:
             if not acquired:
                 return False
@@ -467,11 +471,75 @@ def _count_newlines(path: Path, offset: int) -> int:
     return total
 
 
+def _compact_value(value: Any, depth: int = 0) -> Any:
+    """Bound long strings to their head and tail.
+
+    Error extraction needs the start of an output (the command echo and first
+    diagnostic) and its end (the final exception line of a traceback). The
+    middle of a 200 KB file dump is never evidence, and persisting it made
+    each cursor file several hundred kilobytes.
+    """
+    if depth > 12:
+        return value
+    if isinstance(value, str):
+        if len(value) <= STEP_STRING_LIMIT:
+            return value
+        half = STEP_STRING_LIMIT // 2
+        return value[:half] + "\n…\n" + value[-half:]
+    if isinstance(value, dict):
+        return {key: _compact_value(item, depth + 1) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_compact_value(item, depth + 1) for item in value]
+    return value
+
+
+def compact_step(step: dict[str, Any]) -> dict[str, Any]:
+    """Redact credentials and bound string sizes before a step is persisted."""
+    try:
+        compacted = redact_mapping(_compact_value(step))
+    except Exception:
+        return step
+    return compacted if isinstance(compacted, dict) else step
+
+
+def scrub_cursor_files(state_dir: Path | None = None) -> dict[str, int]:
+    """Rewrite stored cursors so none still holds raw, unredacted steps.
+
+    Older cursors persisted transcript steps verbatim, including any credential
+    the user pasted into a prompt. Cursors from an older version are deleted
+    (the next Stop re-reads the transcript); current ones are re-compacted.
+    """
+    root = (state_dir or get_state_dir()) / "transcript_cursors"
+    stats = {"checked": 0, "rewritten": 0, "removed": 0}
+    if not root.is_dir():
+        return stats
+    for path in sorted(root.glob("*.json")):
+        stats["checked"] += 1
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            raw = None
+        cursor = TranscriptCursor.from_dict(raw)
+        try:
+            if cursor is None:
+                path.unlink()
+                stats["removed"] += 1
+                continue
+            cursor.context = [compact_step(step) for step in cursor.context]
+            payload = json.dumps(cursor.to_dict(), ensure_ascii=False, default=str) + "\n"
+            if payload != path.read_text(encoding="utf-8"):
+                atomic_write_text(path, payload)
+                stats["rewritten"] += 1
+        except OSError:
+            continue
+    return stats
+
+
 def _bounded_context(
     steps: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], bool]:
     """Keep the newest steps within the step and byte budgets."""
-    bounded = list(steps[-CONTEXT_LIMIT_STEPS:])
+    bounded = [compact_step(step) for step in steps[-CONTEXT_LIMIT_STEPS:]]
     dropped = len(bounded) < len(steps)
     total = 0
     kept: list[dict[str, Any]] = []

@@ -41,12 +41,21 @@ from .skill_builder import (
     SkillError,
     SkillQualityError,
 )
-from .util import file_lock, hash_steps, one_line, truncate
+from .util import (
+    file_lock,
+    foreign_windows_paths,
+    hash_steps,
+    iter_strings,
+    one_line,
+    path_root_key,
+    text_mentions_root,
+    truncate,
+)
 
 MAX_SKILLS_PER_SESSION = 2
 MIN_WORKFLOW_QUALITY = 0.55
 MAX_DIRECTIVES_PER_CYCLE = 5
-_WINDOWS_PATH_RE = re.compile(r"[A-Za-z]:\\[^\s`\"'<>|)]+")
+
 
 
 def cycle_lock_path(workspace: Path | str | None) -> Path:
@@ -194,6 +203,11 @@ class HarnessEngine:
         pending_events: Sequence[dict[str, Any]] | None,
     ) -> EngineResult:
         transcript = self._resolve_transcript(conversation_id, transcript_path)
+        # Known up front so skipped and empty cycles stay attributable in the
+        # event journal and in `harness status`.
+        result.conversation_id = safe_conversation_id(
+            conversation_id or self._conversation_from_path(transcript)
+        )
         analyzer = TranscriptAnalyzer(transcript)
         incremental: IncrementalRead | None = None
         used_transcript_steps = raw_steps is None and transcript is not None
@@ -404,7 +418,11 @@ class HarnessEngine:
             )
             if worth_writing:
                 try:
-                    task_text = "; ".join(analysis.tasks)[:200] or "Interactive session"
+                    # The router cleans and bounds the text; cutting it here
+                    # first split quoted paths in half.
+                    # Route for the newest request: that is what the next turn
+                    # continues, not whatever the session opened with.
+                    task_text = (analysis.tasks[-1] if analysis.tasks else "")[:2000] or "Interactive session"
                     routed = router.apply(task_text)
                     result.routing = routed.as_dict()
                     result.warnings.extend(result.routing.get("warnings", []))
@@ -447,7 +465,7 @@ class HarnessEngine:
 
     @staticmethod
     def _root_prefix(workspace: Path | str) -> str:
-        return str(Path(workspace).resolve()).lower().replace("/", "\\").rstrip("\\")
+        return path_root_key(workspace)
 
     def _steps_belong_to_workspace(
         self,
@@ -459,30 +477,23 @@ class HarnessEngine:
         Transcripts with no absolute paths are allowed. Once an absolute path
         appears, at least one must live under the workspace; otherwise the
         transcript belongs to another project.
+
+        Strings are scanned as they appear in the transcript, not as a JSON
+        dump: escaping turned ``"task:\\n"`` into a fake ``k:\\n`` drive path.
+        The root is matched at each path's position, so workspace folders with
+        spaces or apostrophes ("video editor", "instagram dm's") are found.
         """
         root = self._root_prefix(workspace)
-        inside = 0
-        outside = 0
-        seen: set[str] = set()
+        outside = False
         for step in list(steps)[:250]:
-            text = (
-                json.dumps(step, ensure_ascii=False)
-                if isinstance(step, dict)
-                else str(step)
-            )
-            for match in _WINDOWS_PATH_RE.findall(text):
-                normalized = re.sub(r"\\+", r"\\", match).lower()
-                key = normalized[:200]
-                if key in seen:
-                    continue
-                seen.add(key)
-                if key.startswith(root):
-                    inside += 1
-                else:
-                    outside += 1
-        if outside == 0:
-            return True
-        return inside > 0
+            for text in iter_strings(step):
+                if text_mentions_root(text, root):
+                    return True
+                # Agent and tool install folders (~/.gemini, AppData, Program
+                # Files) appear in every transcript and belong to no project.
+                if not outside and foreign_windows_paths(text, root, ignore_tooling=True):
+                    outside = True
+        return not outside
 
     def _drop_foreign_path_events(
         self,
@@ -494,19 +505,17 @@ class HarnessEngine:
         root = self._root_prefix(workspace)
         kept: list[ContrastiveEvent] = []
         for event in events:
-            text = " ".join(
-                str(value)
-                for value in (
-                    event.error_message,
-                    event.resolution_summary,
-                    event.failed_args,
-                    event.successful_args,
-                )
-            )
             foreign = [
-                match
-                for match in _WINDOWS_PATH_RE.findall(text)
-                if not re.sub(r"\\+", r"\\", match).lower().startswith(root)
+                path
+                for text in iter_strings(
+                    [
+                        event.error_message,
+                        event.resolution_summary,
+                        event.failed_args,
+                        event.successful_args,
+                    ]
+                )
+                for path in foreign_windows_paths(text, root, ignore_tooling=True)
             ]
             if foreign:
                 self._add_warning(

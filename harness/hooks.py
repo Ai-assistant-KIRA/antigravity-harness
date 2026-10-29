@@ -440,8 +440,8 @@ def handle_post_tool_use(payload: dict[str, Any] | None = None) -> dict[str, Any
             }
             _append_pending(event)
             _journal("PostToolUse:error", event)
-        else:
-            _journal("PostToolUse", {"tool": tool_name, "conversation_id": _conversation_id(payload)})
+        # Successful calls are not journaled: they were 88% of events.jsonl
+        # and Stop already reads every call from the transcript.
     except Exception as exc:
         _log_error("PostToolUse", exc)
     return {}
@@ -473,7 +473,7 @@ def handle_stop(payload: dict[str, Any] | None = None) -> dict[str, Any]:
         _journal(
             "Stop:result",
             {
-                "conversation_id": result.conversation_id,
+                "conversation_id": result.conversation_id or conversation_id,
                 "status": result.status,
                 "summary": result.summary,
                 "warnings": result.warnings,

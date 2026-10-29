@@ -33,7 +33,7 @@ from .config import (
     get_workspace_skills_dir,
     slugify,
 )
-from .redaction import contains_secret, redact
+from .redaction import contains_secret, redact, redact_strict
 from .trust import Finding, is_safe_to_install, scan_skill, scan_text
 from .util import (
     atomic_write_text,
@@ -374,13 +374,79 @@ class SkillBuilder:
             name = re.sub(r"-{2,}", "-", name).strip("-")
         return name or "harness-skill"
 
+    _GOAL_FILLER_RE = re.compile(
+        r"(?i)^(?:(?:okay|ok|so|hey|hi|alright|now|well|please|pls|also|and)[\s,]+)*"
+        r"(?:(?:i|we)\s+(?:want|need|would like|wanna)\s+(?:you\s+)?to\s+|"
+        r"(?:can|could|would)\s+you\s+|let'?s\s+|i\s+have\s+(?:made|added)\s+|"
+        r"i\s+(?:just\s+)?(?:added|made|did)\s+)?"
+    )
+
+    _CHATTY_GOAL_RE = re.compile(
+        r"(?i)\b(?:i|i'm|i've|we|my|our|me|abit|like|want|need|looks?|kinda|maybe|"
+        r"please|okay|ok|now|so)\b"
+    )
+    _FAMILY_PREFIXES = (
+        "edit-video-", "edit-audio-", "run-node-task-", "run-python-task-",
+        "deploy-cloudflare-", "browser-test-", "run-python-tests-", "powershell-",
+    )
+
+    def _clean_goal(self, goal: str) -> str:
+        """The request without filler, paths, or redaction markers."""
+        text = re.sub(r"\S*\[REDACTED\]\S*", " ", redact_strict(goal or ""))
+        text = self._GOAL_FILLER_RE.sub("", strip_paths(text)).strip(" ,;:-")
+        return one_line(text, 240)
+
+    def _goal_is_chatty(self, goal: str) -> bool:
+        words = goal.split()
+        return len(words) > 18 or len(self._CHATTY_GOAL_RE.findall(goal)) >= 2
+
+    @staticmethod
+    def _procedure_summary(steps: Sequence[str], limit: int = 3) -> str:
+        """Join the agent's own step summaries: "Inspect palette; Compare backgrounds"."""
+        summaries: list[str] = []
+        for step in steps:
+            match = re.search(r"\(([^()]{6,80})\)\s*$", str(step))
+            if not match:
+                continue
+            summary = match.group(1).strip()
+            if summary and summary.casefold() not in {item.casefold() for item in summaries}:
+                summaries.append(summary)
+            if len(summaries) >= limit:
+                break
+        return "; ".join(summaries)
+
+    def _title(self, workflow: WorkflowCandidate, name: str) -> str:
+        goal = self._clean_goal(workflow.goal)
+        if goal and not self._goal_is_chatty(goal):
+            title = short_goal(goal, 90)
+        else:
+            stem = name
+            for prefix in self._FAMILY_PREFIXES:
+                if stem.startswith(prefix):
+                    stem = stem[len(prefix):]
+                    break
+            title = stem.replace("-", " ")
+        return title[:1].upper() + title[1:]
+
     def _description(self, workflow: WorkflowCandidate) -> str:
-        goal = short_goal(strip_paths(workflow.goal), 150)
+        """Say what the skill does and when to load it, without the raw prompt."""
+        goal = self._clean_goal(workflow.goal)
+        summary = self._procedure_summary(workflow.steps)
+        if summary and (not goal or self._goal_is_chatty(goal)):
+            # A chatty prompt describes a mood; the agent's step summaries
+            # describe the procedure.
+            goal = summary
+        goal = short_goal(goal, 150) if goal != summary else truncate(goal, 160)
+        goal = goal or workflow.name.replace("-", " ")
+        goal = goal[:1].upper() + goal[1:]
         keywords = ", ".join(workflow.trigger_keywords[:6])
-        description = f"Repeatable procedure for: {goal}."
+        description = f"{goal}."
         if keywords:
             description += f" Use when the task involves {keywords}."
-        return truncate(redact(description), 420)
+        steps = len(self._dedupe_steps(workflow.steps))
+        if steps:
+            description += f" {steps} verified step(s)."
+        return truncate(redact_strict(description), 420)
 
     # ---------------------------------------------------------------- rendering
     def _render(
@@ -394,8 +460,9 @@ class SkillBuilder:
         version: int,
         user_tail: str = "",
     ) -> str:
-        title = short_goal(strip_paths(workflow.goal), 90) or name.replace("-", " ")
+        title = self._title(workflow, name) or name.replace("-", " ")
         trigger = workflow.trigger_keywords[:8]
+        matches = short_goal(self._clean_goal(workflow.goal), 180)
         metadata = {
             "version": version,
             "updated": utc_iso(),
@@ -417,8 +484,9 @@ class SkillBuilder:
             "> Learned and maintained by Harness². Edit only the notes below the managed block.",
             "",
             "## When to Use",
-            f"- The task matches: {short_goal(strip_paths(workflow.goal), 180)}",
         ]
+        if matches:
+            lines.append(f"- The task matches: {matches}")
         if trigger:
             lines.append(f"- Relevant signals: {', '.join(trigger)}")
         if workflow.tools_involved:
@@ -448,6 +516,9 @@ class SkillBuilder:
                 lines.append(f"- {pitfall}")
         lines.append("")
         lines.append(SKILL_END)
+        # Last line of defence: a generated skill is a project file that is
+        # often committed. No credential may reach it, whatever its shape.
+        lines = [redact_strict(line) for line in lines]
         body = "\n".join(lines).strip() + "\n"
         if user_tail.strip():
             body += "\n" + user_tail.strip() + "\n"
@@ -701,6 +772,53 @@ class SkillBuilder:
             "name": name or skill_file.parent.name,
             "description": description,
         }
+
+    # ------------------------------------------------------------------ privacy
+    def managed_skill_files(self, workspace_path: Path | str | None = None) -> list[Path]:
+        """Harness-generated SKILL.md files in the workspace skills folder."""
+        workspace = Path(workspace_path).expanduser() if workspace_path else self.workspace_path
+        if not workspace:
+            return []
+        root = get_workspace_skills_dir(workspace)
+        files: list[Path] = []
+        if not root.is_dir():
+            return files
+        for skill_file in sorted(root.glob("*/SKILL.md")):
+            try:
+                text = skill_file.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if self._is_harness_managed(text):
+                files.append(skill_file)
+        return files
+
+    def scrub_managed_skills(
+        self,
+        workspace_path: Path | str | None = None,
+        dry_run: bool = False,
+    ) -> list[str]:
+        """Redact credentials from Harness-generated skills; return changed paths.
+
+        Only the managed block is rewritten. Hand-written skills and the notes a
+        user added below the block are never touched.
+        """
+        changed: list[str] = []
+        for skill_file in self.managed_skill_files(workspace_path):
+            try:
+                text, encoding, newline = read_text_lossless(skill_file)
+            except (OSError, UnicodeError):
+                continue
+            match = SKILL_RE.search(text)
+            head = text[: match.start()] if match else text
+            block = match.group(0) if match else ""
+            tail = text[match.end():] if match else ""
+            scrubbed = redact_strict(head) + redact_strict(block) + tail
+            if scrubbed == text:
+                continue
+            changed.append(str(skill_file))
+            if not dry_run:
+                atomic_write_text(skill_file, scrubbed, encoding=encoding, newline=newline)
+        return changed
 
     # ------------------------------------------------------------------ discovery
     def list_installed_skills(

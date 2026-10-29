@@ -301,3 +301,134 @@ def read_json(path: Path, default: Any = None) -> Any:
 
 def write_json(path: Path, data: Any) -> None:
     atomic_write_text(Path(path), json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+
+
+# ---------------------------------------------------------------- path scoping
+# A Windows absolute path. The look-behind keeps escape sequences such as the
+# ``k:\n`` inside ``"task:\n"`` from looking like a drive letter. The match
+# deliberately stops at whitespace; callers that need to know whether a path
+# lives under a root that itself contains spaces ("video editor") must use
+# :func:`path_starts_with_root` at the match position instead of comparing the
+# truncated match.
+WINDOWS_PATH_RE = re.compile(r"(?<![A-Za-z0-9_\\])[A-Za-z]:[\\/](?![nrt]\b)[^\s`\"'<>|)]*")
+
+
+def iter_strings(value: Any, depth: int = 0) -> Iterator[str]:
+    """Yield every string inside a JSON-like value (keys excluded)."""
+    if depth > 12:
+        return
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from iter_strings(item, depth + 1)
+    elif isinstance(value, (list, tuple, set)):
+        for item in value:
+            yield from iter_strings(item, depth + 1)
+
+
+def normalize_path_text(text: str) -> str:
+    """Lowercase and collapse any run of slashes to one backslash."""
+    return re.sub(r"[\\/]+", r"\\", text or "").lower()
+
+
+def path_root_key(root: Path | str) -> str:
+    """Comparable form of a workspace root (resolved, lowercase, no trailing slash)."""
+    try:
+        resolved = str(Path(root).resolve())
+    except OSError:
+        resolved = str(root)
+    return normalize_path_text(resolved).rstrip("\\")
+
+
+def path_starts_with_root(text: str, start: int, root_key: str) -> bool:
+    """True when ``text[start:]`` begins with the workspace root.
+
+    The comparison happens on the original text, so spaces and apostrophes in
+    the root are honoured. The character after the root must end the folder
+    name, so ``video editor-old`` is not inside ``video editor``.
+    """
+    if not root_key:
+        return False
+    window = normalize_path_text(text[start : start + 2 * len(root_key) + 16])
+    if not window.startswith(root_key):
+        return False
+    following = window[len(root_key) : len(root_key) + 1]
+    return not following or not (following.isalnum() or following in "_-.")
+
+
+def text_mentions_root(text: str, root_key: str) -> bool:
+    """True when any absolute path in ``text`` points inside ``root_key``."""
+    if not text or not root_key:
+        return False
+    if root_key not in normalize_path_text(text):
+        return False
+    return any(
+        path_starts_with_root(text, match.start(), root_key)
+        for match in WINDOWS_PATH_RE.finditer(text)
+    ) or _posix_mentions_root(text, root_key)
+
+
+def _posix_mentions_root(text: str, root_key: str) -> bool:
+    # Roots on macOS/Linux have no drive letter; a substring test is enough
+    # once the folder boundary is checked.
+    if ":" in root_key[:3]:
+        return False
+    normalized = normalize_path_text(text)
+    index = normalized.find(root_key)
+    while index >= 0:
+        following = normalized[index + len(root_key) : index + len(root_key) + 1]
+        if not following or not (following.isalnum() or following in "_-."):
+            return True
+        index = normalized.find(root_key, index + 1)
+    return False
+
+
+# Installed tools are not "another project". A lesson about the Blender or
+# Python executable a project uses must survive the foreign-path filter.
+_TOOLING_PATH_RE = re.compile(
+    r"(?i)^[a-z]:[\\/]+(?:program files(?: \(x86\))?|programdata|windows)(?:[\\/]|$)"
+    r"|^[a-z]:[\\/]+users[\\/]+[^\\/]+[\\/]+(?:appdata|\.gemini|\.kiro|\.cursor|\.vscode|"
+    r"\.codex|\.claude|\.config|\.local|\.cache)(?:[\\/]|$)"
+)
+
+
+def is_tooling_path(path: str) -> bool:
+    """True for system/tool install locations such as Program Files."""
+    return bool(_TOOLING_PATH_RE.search(path or ""))
+
+
+def foreign_windows_paths(
+    text: str,
+    root_key: str,
+    ignore_tooling: bool = False,
+) -> list[str]:
+    """Absolute Windows paths in ``text`` that do not live under ``root_key``.
+
+    With ``ignore_tooling``, install locations such as ``C:\\Program Files``
+    are not reported. Like the root check, that test reads the original text
+    at the match position, because the match itself stops at the space in
+    "Program Files".
+    """
+    foreign: list[str] = []
+    for match in WINDOWS_PATH_RE.finditer(text or ""):
+        if len(match.group(0)) < 4:
+            # A bare drive such as ``C:\`` carries no project identity.
+            continue
+        if root_key and path_starts_with_root(text, match.start(), root_key):
+            continue
+        if root_key and _truncated_prefix_of_root(text, match, root_key):
+            continue
+        if ignore_tooling and is_tooling_path(text[match.start() : match.start() + 160]):
+            continue
+        foreign.append(match.group(0))
+    return foreign
+
+
+def _truncated_prefix_of_root(text: str, match: re.Match[str], root_key: str) -> bool:
+    """``C:\\Users\\me\\Desktop\\vid…`` was cut by a length limit, not foreign."""
+    end = match.end()
+    if not text[end : end + 1] == "\u2026" and not match.group(0).endswith("\u2026"):
+        return False
+    stem = normalize_path_text(match.group(0).rstrip("\u2026"))
+    return len(stem) >= 4 and root_key.startswith(stem)

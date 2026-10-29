@@ -137,6 +137,20 @@ def _json_assignment(match: re.Match[str]) -> str:
     return f"{key_quote}{key}{key_quote}: {value_quote}{REDACTED}{value_quote}"
 
 
+def _call_assignment(match: re.Match[str]) -> str:
+    key_quote, key, separator, value_quote, _value = match.groups()
+    if not _is_sensitive_key(key):
+        return match.group(0)
+    return f"{key_quote}{key}{key_quote}{separator}{value_quote}{REDACTED}{value_quote}"
+
+
+def _setx_assignment(match: re.Match[str]) -> str:
+    command, key, separator, quote, value = match.groups()
+    if not _is_sensitive_key(key) or value.startswith("/"):
+        return match.group(0)
+    return f"{command}{key}{separator}{quote}{REDACTED}{quote}"
+
+
 def _flag_assignment(match: re.Match[str]) -> str:
     flag, separator, quote, value = match.groups()
     candidate = value.strip()
@@ -163,13 +177,33 @@ _PATTERNS: list[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]]] = 
     (
         re.compile(
             r"(?i)(?<![\w-])(--?(?:API[_-]?KEY|ACCESS[_-]?(?:KEY|TOKEN)|AUTH[_-]?TOKEN|TOKEN|PASSWORD|"
-            r"PASSWD|SECRET|CLIENT[_-]?SECRET|PRIVATE[_-]?KEY))(=|[ \t]+)([\"']?)"
+            r"PASSWD|SECRET|CLIENT[_-]?SECRET|PRIVATE[_-]?KEY)|--key)(=|[ \t]+)([\"']?)"
             r"([^\s\"']{4,})\3"
         ),
         _flag_assignment,
     ),
+    # Function-call forms where the name and the value are separate arguments:
+    # [Environment]::SetEnvironmentVariable("X_API_KEY", "value", "User"),
+    # os.environ.setdefault("TOKEN", "value"), setenv("SECRET", "value").
+    (
+        re.compile(
+            r"(?i)([\"'])([A-Z0-9_]*(?:" + _SENSITIVE_WORD + r")[A-Z0-9_]*)\1"
+            r"(\s*,\s*)([\"'])([^\"'\r\n]{4,})\4"
+        ),
+        _call_assignment,
+    ),
+    # Windows ``setx NAME value`` and POSIX ``export NAME value``-less forms.
+    (
+        re.compile(
+            r"(?i)\b(setx(?:\.exe)?\s+)([A-Z0-9_]*(?:" + _SENSITIVE_WORD + r")[A-Z0-9_]*)"
+            r"(\s+)([\"']?)([^\s\"']{4,})\4"
+        ),
+        _setx_assignment,
+    ),
     # Well-known token prefixes.
     (re.compile(r"\bsk-(?:proj-|ant-)?[A-Za-z0-9_-]{12,}\b"), "sk-" + REDACTED),
+    # ``sk_`` / ``rk_`` keys (ElevenLabs, Stripe live/test secret keys).
+    (re.compile(r"\b(?:sk|rk)_(?:live_|test_)?[A-Za-z0-9]{20,}\b"), "sk_" + REDACTED),
     (re.compile(r"\bgh[pousr]_[A-Za-z0-9]{16,}\b"), "gh_" + REDACTED),
     (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"), "github_pat_" + REDACTED),
     (re.compile(r"\bglpat-[A-Za-z0-9_-]{16,}\b"), "glpat-" + REDACTED),
@@ -266,3 +300,41 @@ def contains_secret(text: str) -> bool:
     if not isinstance(text, str) or not text:
         return False
     return redact(text) != text
+
+
+# A bare credential pasted without a recognisable name or prefix, such as a
+# 32-character hex API key. Too aggressive for memory (content hashes are
+# legitimate there), so it is only applied to text that is written into
+# project files: SKILL.md, AGENTS.md rules, and routing lines.
+_HIGH_ENTROPY_RE = re.compile(r"(?<![A-Za-z0-9_/\\.-])[A-Za-z0-9_-]{24,}(?![A-Za-z0-9_/\\.-])")
+
+
+def _looks_high_entropy(token: str) -> bool:
+    if REDACTED.strip("[]") in token:
+        return False
+    digits = sum(char.isdigit() for char in token)
+    letters = sum(char.isalpha() for char in token)
+    if digits < 6 or letters < 6:
+        return False
+    # Slugs and identifiers made of words ("edit-video-2026-10-27-export") are
+    # not secrets: secrets have long runs without separators.
+    longest_run = max((len(part) for part in re.split(r"[-_]", token)), default=0)
+    return longest_run >= 20
+
+
+def redact_strict(text: str) -> str:
+    """:func:`redact` plus bare high-entropy tokens, for project artifacts."""
+    if not isinstance(text, str) or not text:
+        return text
+    result = redact(text)
+    return _HIGH_ENTROPY_RE.sub(
+        lambda match: REDACTED if _looks_high_entropy(match.group(0)) else match.group(0),
+        result,
+    )
+
+
+def contains_secret_strict(text: str) -> bool:
+    """Whether :func:`redact_strict` would change the text."""
+    if not isinstance(text, str) or not text:
+        return False
+    return redact_strict(text) != text

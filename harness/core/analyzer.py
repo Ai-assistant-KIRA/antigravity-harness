@@ -22,7 +22,18 @@ from pathlib import Path
 from typing import Any
 
 from .config import detect_project_signals, get_plugin_dir, tokenize
-from .redaction import redact
+from .recovery import (
+    INLINE_QUOTING_RULE,
+    INLINE_QUOTING_SIGNATURE,
+    commands_match,
+    is_benign_status,
+    is_causal_command_fix,
+    is_inline_code,
+    is_inline_quoting_failure,
+    is_transient_error,
+    strip_command_prefix,
+)
+from .redaction import redact, redact_strict
 from .util import (
     is_chatty_directive,
     jaccard,
@@ -166,6 +177,11 @@ class TranscriptAnalyzer:
         r"^\s*git\s+(status|diff|log|show|branch)\b",
         r"^\s*(node|python|python3|npm|pnpm|yarn)\s+(--version|-v)\b",
         r"^\s*(Get-ChildItem|Get-Content|Get-Item|Select-Object)\b",
+        # Read-only probes: they check state, they do not move a task forward.
+        r"^\s*(Test-Path|Get-Process|Get-Command|Get-Service|Get-NetTCPConnection|"
+        r"Select-String|Measure-Object|Resolve-Path|Get-Location|where\.exe)\b",
+        r"^\s*(?:Get|Test)-[A-Za-z]+\b",
+        r"\s--(?:version|help)\s*$",
     )
 
     VERIFICATION_COMMAND = re.compile(
@@ -271,6 +287,9 @@ class TranscriptAnalyzer:
         failed_candidates: list[ToolExecution] = []
         canonical_tasks: list[str] = []
         current_task_index = -1
+        # Step indices of file edits. A rerun that succeeds after an edit was
+        # fixed by the edit, not by retrying.
+        self._write_steps: list[int] = []
 
         for step in steps:
             step_type = str(step.get("type", "") or "")
@@ -317,6 +336,8 @@ class TranscriptAnalyzer:
                     )
                     executions.append(execution)
                     pending.append(execution)
+                    if name in self.FILE_WRITE_TOOLS:
+                        self._write_steps.append(execution.step_index)
                     self._record_skill_usage(args, name, analysis.skill_usage)
                 continue
 
@@ -535,7 +556,9 @@ class TranscriptAnalyzer:
             r"(?i)connection refused",
             r"(?i)econn(refused|reset)",
             r"(?i)npm ERR!",
-            r"(?i)FAILED\s+\S+",
+            # Case-sensitive: pytest's ``FAILED tests/x.py``, not a status
+            # summary such as ``1/1 ready, 0 failed (16ms)``.
+            r"\bFAILED\s+\S+",
             r"(?i)exit code [1-9]\d*",
             r"(?i)exited with code [1-9]\d*",
         ]
@@ -544,6 +567,10 @@ class TranscriptAnalyzer:
         confidence = 0.0
         for line in lines:
             if self._is_noise_line(line):
+                continue
+            if is_benign_status(line) and not re.search(
+                r"Traceback|Error\b|Exception\b", line
+            ):
                 continue
             if any(re.search(pattern, line) for pattern in explicit_patterns):
                 chosen = line
@@ -570,7 +597,18 @@ class TranscriptAnalyzer:
         # Include the final line of a Python traceback so the rule names the
         # actual exception rather than only "Traceback".
         if "traceback (most recent call last)" in text.lower():
-            last = next((line for line in reversed(lines) if not self._is_noise_line(line)), chosen)
+            # Prefer the exception line ("KeyError: 'scenes'") over whatever
+            # the program printed last, which may be ordinary output.
+            exception_line = next(
+                (
+                    line for line in reversed(lines)
+                    if re.match(r"^[A-Za-z_][\w.]*(?:Error|Exception|Exit|Interrupt|Warning)\b", line)
+                ),
+                "",
+            )
+            last = exception_line or next(
+                (line for line in reversed(lines) if not self._is_noise_line(line)), chosen
+            )
             if last and last != chosen:
                 chosen = f"{chosen} {last}"
 
@@ -599,6 +637,9 @@ class TranscriptAnalyzer:
         if re.match(r"^Command exited with code \d+\.?$", stripped):
             return True
         if re.match(r"^Command output:\s*$", stripped):
+            return True
+        # Host markup such as ``</SYSTEM_MESSAGE>`` is never a diagnostic.
+        if re.fullmatch(r"</?[A-Z][A-Z0-9_]{2,}>", stripped):
             return True
         return False
 
@@ -742,20 +783,17 @@ class TranscriptAnalyzer:
             success_path = cls._normalized_identity(cls._target_path(success))
             return bool(failed_path) and failed_path == success_path
         if failed.name in cls.COMMAND_TOOLS:
-            failed_identity = cls._command_identity(failed.command())
-            success_identity = cls._command_identity(success.command())
-            if not failed_identity or not success_identity:
-                return False
             failure_text = normalize_for_compare(failed.error_signature or failed.error or "")
             recovery_output = normalize_for_compare(success.output or "")
             if failure_text and failure_text in recovery_output:
                 return False
-            if failed_identity == success_identity:
-                return True
-            # Same executable with a different subcommand is a valid recovery
-            # (e.g. `python setup.py` -> `python -m build`). File paths stay
-            # strict above because a different file is a different target.
-            return failed_identity.split(" ", 1)[0] == success_identity.split(" ", 1)[0]
+            # Same program and target is a retry. A different target of the
+            # same program (`python a.py` -> `python b.py`) only counts when the
+            # failure was about the command form (`no setup.py found` ->
+            # `python -m build`) or PowerShell could not quote inline code.
+            return is_causal_command_fix(
+                failed.command(), failed.error or "", success.command()
+            )
         failed_argument = cls._primary_argument(failed)
         success_argument = cls._primary_argument(success)
         return bool(failed_argument) and failed_argument == success_argument
@@ -824,8 +862,10 @@ class TranscriptAnalyzer:
         event = self._formulate_contrastive_event(failed_call, success, conversation_id)
         if event:
             analysis.contrastive_events.append(event)
-            if event.category in ("environment", "network") and not self._is_self_referential(
-                event.resolution_summary
+            if (
+                event.verified
+                and event.category in ("environment", "network")
+                and not self._is_self_referential(event.resolution_summary)
             ):
                 analysis.environment_quirks.append(event.resolution_summary)
         setattr(failed_call, "_recovered", True)
@@ -1050,7 +1090,54 @@ class TranscriptAnalyzer:
         ):
             return None
         category = self._categorize(failed, error)
-        unchanged = bool(failed_command) and failed_command == recovery_command
+        is_command = failed.name in self.COMMAND_TOOLS
+        unchanged = bool(failed_command) and (
+            failed_command == recovery_command
+            or (is_command and failed_command.strip() == recovery_command.strip())
+        )
+        edited_between = any(
+            failed.step_index < index < recovery.step_index
+            for index in getattr(self, "_write_steps", ())
+        )
+
+        if is_command and is_inline_quoting_failure(failed_command, error):
+            # One lesson for the whole class. Per-command rules ("use
+            # scratch/x.py") never matched the next one-liner and piled up.
+            return ContrastiveEvent(
+                trigger_tool=failed.name,
+                failed_args=failed.args,
+                error_message=error,
+                successful_args=recovery.args,
+                resolution_summary=INLINE_QUOTING_RULE,
+                category="syntax",
+                verified=True,
+                confidence=0.9,
+                error_signature=INLINE_QUOTING_SIGNATURE,
+                recovery_tool=recovery.name,
+                session_id=conversation_id,
+                scope="workspace",
+            )
+
+        # Evidence that does not generalise is kept as an unverified candidate:
+        # * a throwaway inline one-liner that failed for a non-quoting reason;
+        # * a rerun that only succeeded because files were edited in between
+        #   (the fix was the edit, which the rule cannot describe);
+        # * a different target of the same program after a runtime failure.
+        promotable = True
+        if (
+            is_command
+            and is_inline_code(failed_command)
+            and category != "dependency"
+        ):
+            # A missing module found by `python -c "import x"` and fixed by an
+            # install is still a real lesson; only the one-liner is throwaway.
+            promotable = False
+        if is_command and commands_match(failed_command, recovery_command) and edited_between:
+            promotable = False
+        if is_command and not unchanged and not is_causal_command_fix(
+            failed_command, error, recovery_command
+        ) and category not in ("dependency", "environment"):
+            promotable = False
 
         if category == "dependency" and recovery_command:
             if self._is_install_command(recovery_command):
@@ -1094,7 +1181,12 @@ class TranscriptAnalyzer:
             return None
         confidence = 0.9
         if unchanged:
-            confidence = 0.7 if self._is_transient(error) else 0.55
+            # A plain retry only teaches something when the error was
+            # transient. "Blender quit; retrying succeeded" is flakiness, and a
+            # rerun after an edit is a code fix; neither should become a rule.
+            if edited_between:
+                promotable = False
+            confidence = 0.7 if self._is_transient(error) else 0.45
         if not recovery.has_evidence:
             confidence = min(confidence, 0.6)
 
@@ -1105,7 +1197,7 @@ class TranscriptAnalyzer:
             successful_args=recovery.args,
             resolution_summary=summary,
             category=category,
-            verified=True,
+            verified=promotable,
             confidence=confidence,
             error_signature=failed.error_signature or self._signature(error),
             recovery_tool=recovery.name,
@@ -1131,7 +1223,7 @@ class TranscriptAnalyzer:
 
     def _is_transient(self, error: str) -> bool:
         lowered = error.lower()
-        return any(token in lowered for token in self.TRANSIENT_ERRORS)
+        return any(token in lowered for token in self.TRANSIENT_ERRORS) or is_transient_error(error)
 
     # --------------------------------------------------------------- constraints
     def _clean_user_text(self, text: str) -> str:
@@ -1360,6 +1452,22 @@ class TranscriptAnalyzer:
             base_score += 0.12
         if not success:
             base_score -= 0.2
+        # A reusable procedure leaves something to rerun: a script file or a
+        # real check. A log of one-off commands scored 0.99 before and was
+        # never reused.
+        has_script = any(
+            re.search(r"\.(?:py|mjs|cjs|js|ts|ps1|sh|bat)\b", action) for action in command_actions
+        )
+        if not verification and not has_script:
+            base_score -= 0.15
+        throwaway = [
+            action for action in command_actions
+            if re.search(r"(?i)(?:^|[\s\"'`/\\])(?:scratch|tmp|temp)[\\/]", action)
+        ]
+        if command_actions and len(throwaway) * 2 > len(command_actions):
+            base_score -= 0.1
+        if not verification:
+            base_score = min(base_score, 0.85)
         quality = round(max(0.0, min(1.0, base_score)), 2)
 
         if not success:
@@ -1434,11 +1542,15 @@ class TranscriptAnalyzer:
         if execution.name in ("run_command", "run_terminal_command", "shell", "bash"):
             if not command or self._is_exploratory_command(command):
                 return ""
+            if is_inline_code(command):
+                # Inline one-liners are throwaway and break PowerShell quoting
+                # when replayed; a procedure should name a script instead.
+                return ""
             summary = ""
             if isinstance(execution.args, dict):
                 summary = str(execution.args.get("toolSummary") or "").strip()
-            suffix = f" ({one_line(summary, 80)})" if summary else ""
-            return f"Run `{truncate(redact(command), 180)}`{suffix}"
+            suffix = f" ({one_line(redact_strict(summary), 80)})" if summary else ""
+            return f"Run `{truncate(redact_strict(command), 180)}`{suffix}"
         if execution.name in ("write_file", "edit_file", "apply_patch", "replace_file_content"):
             path = Path(command).name if command else "the target file"
             return f"Create or update `{truncate(redact(path), 80)}`"
@@ -1451,7 +1563,12 @@ class TranscriptAnalyzer:
         return ""
 
     def _is_exploratory_command(self, command: str) -> bool:
-        return any(re.search(pattern, command, re.IGNORECASE) for pattern in self.EXPLORATORY_COMMANDS)
+        stripped = strip_command_prefix(command)
+        return any(
+            re.search(pattern, text, re.IGNORECASE)
+            for pattern in self.EXPLORATORY_COMMANDS
+            for text in (command, stripped)
+        )
 
     @staticmethod
     def _is_install_command(command: str) -> bool:
@@ -1504,6 +1621,34 @@ class TranscriptAnalyzer:
             "try", "tried", "let", "lets", "seems", "looks", "update",
             "path", "paths", "name", "names", "value", "values", "string",
             "line", "lines", "true", "false", "none", "null",
+            # Chat filler and reactions: they describe a mood, not a task.
+            "abit", "bit", "better", "best", "good", "nice", "cool", "really",
+            "something", "everything", "anything", "result", "results", "turn",
+            "contain", "redacted", "look", "looks", "okay", "former", "fit",
+            "went", "wrong", "having", "lot", "much", "many", "way", "kind",
+            "thank", "thanks", "hey", "yeah", "yes", "right", "wanna", "gonna",
+        }
+    )
+
+    # Tokens that appear in almost every command on this kind of machine and
+    # say nothing about what a procedure does.
+    _GENERIC_ACTION_TOKENS = frozenset(
+        {
+            "python", "python3", "utf8", "scratch", "work", "tools", "tool", "exe",
+            "users", "desktop", "appdata", "local", "programs", "windows",
+            "x64", "node", "npx", "npm", "pnpm", "yarn", "script", "scripts", "test",
+            "tests", "main", "index", "html", "json", "temp", "tmp", "out", "src",
+            "lib", "bin", "dist", "build", "output", "outputs", "input", "inputs",
+            "data", "noprofile", "executionpolicy", "bypass", "command", "file",
+            "cmd", "powershell", "pwsh", "echo", "print", "import", "from", "true",
+            "false", "none", "self", "res", "result", "results", "verify", "check",
+            "inspect", "debug", "final", "new", "old", "copy", "sys", "path",
+            "insert", "open", "read", "write", "load", "save", "list", "get",
+            "set", "run", "start", "stop", "exit", "help", "version", "error",
+            "errors", "silentlycontinue", "erroraction", "object", "select",
+            "foreach", "where", "item", "items", "content", "child", "location",
+            "dev", "null", "type", "name", "value", "string", "args", "argv",
+            "editor", "video", "project", "main",
         }
     )
 
@@ -1544,14 +1689,28 @@ class TranscriptAnalyzer:
         """
         family = self._workflow_family(executions)
         family_stem = family.split("-")[-1] if family else ""
+        family_words = set(family.split("-")) if family else set()
+
+        home_name = Path.home().name.casefold()
+
+        def _usable(token: str) -> bool:
+            return (
+                token.isalpha()
+                and len(token) >= 3
+                and token not in self._NAME_STOPWORDS
+                and token not in self._GENERIC_ACTION_TOKENS
+                and token != home_name
+                and token not in family_words
+                and not (family_stem and token.startswith(family_stem[:4]))
+            )
+
+        task_tokens = [token for token in tokenize(strip_paths(task)) if _usable(token)]
+        # Name the skill after what the procedure touched (scripts, tools,
+        # services) rather than the first words of the prompt, which produced
+        # names such as "edit-video-okay-former".
+        ranked = [token for token in self._action_tokens(task, executions) if _usable(token)]
         tokens: list[str] = []
-        for token in tokenize(strip_paths(task)):
-            if not token.isalpha() or len(token) < 3:
-                continue
-            if token in self._NAME_STOPWORDS:
-                continue
-            if family_stem and token.startswith(family_stem[:4]):
-                continue
+        for token in ranked + task_tokens:
             if token not in tokens:
                 tokens.append(token)
             if len(tokens) == 2:
@@ -1566,6 +1725,58 @@ class TranscriptAnalyzer:
         if len(name) < 6 or name in {"workflow", "task", "project", "procedure"}:
             return ""
         return name
+
+    def _action_tokens(self, task: str, executions: list[ToolExecution]) -> list[str]:
+        """Words that describe what the procedure did, most telling first.
+
+        Script names weigh most (``sketchfab_blender.py`` -> sketchfab,
+        blender), then words from successful commands and their summaries.
+        Words the user also used get a bonus. Machine noise (``python``,
+        ``utf8``, ``scratch``) and chat filler never qualify.
+        """
+
+        # The user's own account name appears in every absolute path.
+        home_name = Path.home().name.casefold()
+
+        def _usable(token: str) -> bool:
+            return (
+                token.isalpha()
+                and len(token) >= 3
+                and token not in self._NAME_STOPWORDS
+                and token not in self._GENERIC_ACTION_TOKENS
+                and token != home_name
+            )
+
+        task_tokens = {token for token in tokenize(strip_paths(task)) if _usable(token)}
+        scores: dict[str, float] = {}
+        order: dict[str, int] = {}
+
+        def _add(token: str, weight: float) -> None:
+            if _usable(token):
+                scores[token] = scores.get(token, 0.0) + weight
+                order.setdefault(token, len(order))
+
+        for execution in executions:
+            if not execution.success or execution.error:
+                continue
+            command = execution.command()
+            if not command or self._is_exploratory_command(command) or is_inline_code(command):
+                continue
+            for stem in re.findall(r"([A-Za-z][\w-]*)\.(?:py|mjs|cjs|js|ts|ps1|sh|bat|blend)\b", command):
+                for token in re.split(r"[_\-]+", stem.casefold()):
+                    _add(token, 2.0)
+            for token in tokenize(strip_paths(command)):
+                if len(token) >= 4:
+                    _add(token, 1.0)
+            if isinstance(execution.args, dict):
+                summary = str(execution.args.get("toolSummary") or "")
+                for token in tokenize(summary):
+                    if len(token) >= 4:
+                        _add(token, 0.5)
+        for token in task_tokens:
+            if token in scores:
+                scores[token] += 3.0
+        return sorted(scores, key=lambda token: (-scores[token], order[token]))
 
     @staticmethod
     def _workflow_family(executions: list[ToolExecution]) -> str:
@@ -1603,6 +1814,12 @@ class TranscriptAnalyzer:
                 and token not in self._NAME_STOPWORDS
             )
 
+        # What the procedure did first, then what the user said. Chatty
+        # prompts ("i like this result it looks abit better") otherwise
+        # filled the trigger list with words no future request would share.
+        for token in self._action_tokens(task, executions)[:6]:
+            if token not in keywords:
+                keywords.append(token)
         for token in tokenize(strip_paths(task)):
             if _keep(token) and token not in keywords:
                 keywords.append(token)

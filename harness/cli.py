@@ -24,6 +24,7 @@ from .core.config import (
     get_memory_db_path,
     get_plugin_dir,
     get_plugin_rules_path,
+    get_state_dir,
     get_workspace_rules_path,
 )
 from .core.engine import HarnessEngine
@@ -1044,6 +1045,110 @@ def _fts5_available() -> bool:
         conn.close()
 
 
+def _recent_stop_results(limit: int = 12) -> list[dict[str, Any]]:
+    """Newest Stop:result payloads from the event journal, oldest first."""
+    # Read-only: doctor must not create the state directory.
+    path = get_state_dir(create=False) / "events.jsonl"
+    if not path.exists():
+        return []
+    try:
+        with path.open("rb") as handle:
+            size = path.stat().st_size
+            handle.seek(max(0, size - 400_000))
+            lines = handle.read().decode("utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    results: list[dict[str, Any]] = []
+    for line in reversed(lines):
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict) or event.get("event") != "Stop:result":
+            continue
+        payload = event.get("payload") or {}
+        if payload.get("status") == "no_transcript":
+            continue
+        results.append({"timestamp": event.get("timestamp"), **payload})
+        if len(results) >= limit:
+            break
+    return list(reversed(results))
+
+
+def _learning_health() -> tuple[bool, str]:
+    """Detect a Stop hook that runs but never learns anything.
+
+    Every cycle being skipped (for example by a workspace mismatch) looks
+    healthy to every other check, which is how a two-day outage went unseen.
+    """
+    results = _recent_stop_results()
+    if not results:
+        return True, "no Stop cycles recorded yet"
+    statuses: dict[str, int] = {}
+    for item in results:
+        statuses[str(item.get("status"))] = statuses.get(str(item.get("status")), 0) + 1
+    mismatched = sum(
+        1 for item in results
+        if any("workspace mismatch" in str(warning) for warning in item.get("warnings") or [])
+    )
+    summary = ", ".join(f"{count} {status}" for status, count in sorted(statuses.items()))
+    last = str(results[-1].get("timestamp") or "")
+    if len(results) >= 3 and mismatched == len(results):
+        return False, (
+            f"last {len(results)} Stop cycles were all skipped as a workspace mismatch "
+            f"(latest {last}); nothing is being learned"
+        )
+    recent = results[-5:]
+    if len(recent) >= 5 and not any(item.get("status") == "processed" for item in recent):
+        return False, f"no processed Stop cycle in the last {len(recent)} ({summary})"
+    return True, f"last {len(results)} cycles: {summary}"
+
+
+def _secret_leaks(builder: SkillBuilder, workspace: Path | None) -> list[str]:
+    """Generated or managed files that still contain a credential."""
+    from .core.agents_md_manager import MANAGED_RE
+    from .core.redaction import contains_secret_strict
+
+    leaks: list[str] = []
+    # Without --workspace, inspect the current directory, the same place the
+    # skills check above lists from.
+    workspace = workspace or Path.cwd().resolve()
+    try:
+        for skill_file in builder.managed_skill_files(workspace):
+            text = skill_file.read_text(encoding="utf-8", errors="replace")
+            if contains_secret_strict(text):
+                leaks.append(str(skill_file))
+    except Exception:
+        pass
+    for path in (
+        get_workspace_rules_path(workspace) if workspace else None,
+        get_plugin_rules_path(create=False),
+    ):
+        if path is None or not path.exists():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if any(contains_secret_strict(block.group(0)) for block in MANAGED_RE.finditer(text)):
+            leaks.append(str(path))
+    cursor_dir = get_state_dir(create=False) / "transcript_cursors"
+    if cursor_dir.is_dir():
+        from .core.incremental import TranscriptCursor
+
+        for cursor_file in cursor_dir.glob("*.json"):
+            try:
+                cursor = TranscriptCursor.from_dict(
+                    json.loads(cursor_file.read_text(encoding="utf-8"))
+                )
+            except Exception:
+                cursor = None
+            if cursor is None:
+                # Unreadable or a pre-redaction format: treat as unsafe.
+                leaks.append(str(cursor_file))
+    return leaks
+
+
 def cmd_doctor(args: argparse.Namespace) -> None:
     workspace = _workspace(args)
     plugin = get_plugin_dir()
@@ -1141,9 +1246,29 @@ def cmd_doctor(args: argparse.Namespace) -> None:
     try:
         skills = builder.list_installed_skills(workspace)
         invalid = [skill for skill in skills if not skill.get("valid")]
-        add("skills", not invalid, f"{len(skills)} found, {len(invalid)} invalid")
+        detail = f"{len(skills)} found, {len(invalid)} invalid"
+        if invalid:
+            detail += " (" + "; ".join(
+                f"{skill['name']}: {', '.join(skill.get('errors', []))[:80]}"
+                for skill in invalid[:4]
+            ) + ")"
+        add("skills", not invalid, detail)
     except Exception as exc:
         add("skills", False, str(exc))
+
+    learning_ok, learning_detail = _learning_health()
+    add("learning", learning_ok, learning_detail)
+
+    leaks = _secret_leaks(builder, workspace)
+    add(
+        "secrets",
+        not leaks,
+        "none found in generated skills, managed rules, or cursors"
+        if not leaks
+        else f"{len(leaks)} file(s) hold a credential: "
+        + ", ".join(leaks[:4])
+        + " (run `harness privacy scrub`)",
+    )
 
     for label, path in (
         ("workspace rules", get_workspace_rules_path(workspace) if workspace else None),
@@ -1257,6 +1382,9 @@ def cmd_route(args: argparse.Namespace) -> None:
 # ----------------------------------------------------------------------- privacy
 def cmd_privacy(args: argparse.Namespace) -> None:
     workspace = _workspace(args) or Path.cwd().resolve()
+    if args.action == "scrub":
+        _privacy_scrub(workspace, dry_run=args.dry_run, as_json=args.json)
+        return
     report = audit_privacy(
         plugin_dir=get_plugin_dir(),
         workspace=workspace,
@@ -1286,6 +1414,65 @@ def cmd_privacy(args: argparse.Namespace) -> None:
     print("Recommendations:")
     for item in report.get("recommendations", []):
         print(f"  - {item}")
+
+
+def _privacy_scrub(workspace: Path, dry_run: bool, as_json: bool) -> None:
+    """Remove credentials that older versions persisted.
+
+    * transcript cursors: pre-redaction cursors are deleted, current ones are
+      re-redacted (the next Stop re-reads the transcript if needed);
+    * Harness-generated SKILL.md files in this workspace: the managed block is
+      redacted; hand-written skills and user notes are never touched;
+    * managed AGENTS.md blocks: re-sanitized through `rules repair`.
+    """
+    from .core.incremental import scrub_cursor_files
+
+    from .core.agents_md_manager import MANAGED_RE
+    from .core.redaction import contains_secret_strict
+
+    builder = SkillBuilder(workspace)
+    skills = builder.scrub_managed_skills(workspace, dry_run=dry_run)
+    cursors = {"checked": 0, "rewritten": 0, "removed": 0}
+    if not dry_run:
+        cursors = scrub_cursor_files()
+    manager = AgentsMdManager(workspace)
+    # repair() already returns {"workspace": {...}}.
+    rules: dict[str, Any] = dict(manager.repair(target="workspace", dry_run=dry_run))
+    # The global file holds curated rules; only touch it when a managed block
+    # actually contains a credential.
+    plugin_rules = get_plugin_rules_path(create=False)
+    if plugin_rules.exists():
+        text = plugin_rules.read_text(encoding="utf-8", errors="replace")
+        if any(contains_secret_strict(block.group(0)) for block in MANAGED_RE.finditer(text)):
+            rules.update(manager.repair(target="plugin", dry_run=dry_run))
+    report = {
+        "workspace": str(workspace),
+        "dry_run": dry_run,
+        "skills_redacted": skills,
+        "cursors": cursors,
+        "rules": {
+            name: {"updated": bool(value.get("updated")), "removed": value.get("removed", 0)}
+            for name, value in rules.items()
+            if isinstance(value, dict)
+        },
+    }
+    if as_json:
+        _echo(report, True)
+        return
+    print(f"[HARNESS] Privacy scrub{' (dry run)' if dry_run else ''} for {workspace}")
+    print(f"  generated skills redacted : {len(skills)}")
+    for path in skills:
+        print(f"    - {path}")
+    if not dry_run:
+        print(
+            f"  transcript cursors        : {cursors['checked']} checked, "
+            f"{cursors['rewritten']} rewritten, {cursors['removed']} removed"
+        )
+    for name, value in report["rules"].items():
+        print(
+            f"  {name} rules            : "
+            f"{'updated' if value['updated'] else 'unchanged'}, {value['removed']} removed"
+        )
 
 
 # ------------------------------------------------------------------------ install
@@ -1469,9 +1656,12 @@ def build_parser() -> argparse.ArgumentParser:
         "privacy", help="audit stored state, memory, and learned artifacts"
     )
     p_privacy.add_argument(
-        "action", nargs="?", default="audit", choices=["audit"]
+        "action", nargs="?", default="audit", choices=["audit", "scrub"]
     )
     p_privacy.add_argument("--limit", type=int, default=20)
+    p_privacy.add_argument(
+        "--dry-run", action="store_true", help="with scrub: report without writing"
+    )
     p_privacy.add_argument("--json", action="store_true")
     _add_workspace(p_privacy)
     p_privacy.set_defaults(func=cmd_privacy)

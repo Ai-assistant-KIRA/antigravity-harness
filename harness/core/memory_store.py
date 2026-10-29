@@ -156,6 +156,50 @@ def skill_utility(skill: dict[str, Any]) -> float:
     return round(max(0.0, min(2.0, score)), 6)
 
 
+# A generated skill that has been offered this many times and never loaded is
+# retired: it stays on disk (and in `harness skills list`) but is no longer
+# injected into briefings, recall, or task routing.
+RETIRE_AFTER_SURFACINGS = 10
+
+
+def is_retired_skill(skill: dict[str, Any]) -> bool:
+    """True for an auto-generated skill that keeps being surfaced and never used."""
+    source = str(skill.get("source") or "")
+    if source not in ("harness-auto", "auto"):
+        return False
+    reused = max(0, _as_int(skill.get("reused_count"), 0))
+    surfaced = max(0, _as_int(skill.get("surfaced_count"), 0))
+    return reused == 0 and surfaced >= RETIRE_AFTER_SURFACINGS
+
+
+def enrich_skills_with_usage(
+    skills: Sequence[dict[str, Any]],
+    records: Sequence[dict[str, Any]],
+    project: str,
+) -> list[dict[str, Any]]:
+    """Attach reuse/surfacing counters from the memory index to installed skills."""
+    by_name: dict[str, list[dict[str, Any]]] = {}
+    for record in records:
+        by_name.setdefault(str(record.get("name") or ""), []).append(record)
+    enriched: list[dict[str, Any]] = []
+    for skill in skills:
+        item = dict(skill)
+        record = MemoryStore._pick_skill_candidate(
+            by_name.get(str(skill.get("name") or ""), []),
+            str(skill.get("scope") or "") or None,
+            None,
+            project,
+        )
+        if record:
+            item["reused_count"] = int(record.get("reused_count") or 0)
+            item["surfaced_count"] = int(record.get("surfaced_count") or 0)
+            item.setdefault("last_used_at", record.get("last_used_at"))
+            if not item.get("source") or item.get("source") == "manual":
+                item["source"] = record.get("source") or item.get("source")
+        enriched.append(item)
+    return enriched
+
+
 _SKILL_SCOPE_RANK = {"workspace": 0, "user": 1, "plugin": 2, "global": 3}
 
 

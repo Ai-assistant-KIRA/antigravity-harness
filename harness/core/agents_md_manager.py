@@ -22,13 +22,23 @@ from typing import Any, Callable, Iterable, Sequence
 
 from .analyzer import ContrastiveEvent
 from .config import get_plugin_dir, get_plugin_rules_path, get_workspace_rules_path
-from .redaction import contains_secret, redact
+from .recovery import (
+    INLINE_QUOTING_RULE,
+    is_benign_status,
+    is_causal_command_fix,
+    is_inline_code,
+    is_inline_quoting_failure,
+    is_transient_error,
+)
+from .redaction import contains_secret, contains_secret_strict, redact, redact_strict
 from .util import (
     atomic_write_text,
+    foreign_windows_paths,
     is_chatty_directive,
     jaccard,
     normalize_for_compare,
     one_line,
+    path_root_key,
     read_text_lossless,
     truncate,
 )
@@ -152,6 +162,12 @@ _TASK_PREFIXES = (
     "make sure",
     "remember to",
 )
+# A directive that points at "it" or "right now" only made sense inside the
+# conversation that produced it.
+_ONE_OFF_RE = re.compile(
+    r"(?i)\b(?:it|this one|that one|right now|for now|this time|today|tonight|"
+    r"yesterday|just now|so far)\b"
+)
 _PLUGIN_ROOT_LITERAL = ".gemini/config/plugins/harness"
 _CODE_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
 _WINDOWS_ABS_PATH_RE = re.compile(r"[A-Za-z]:\\")
@@ -271,6 +287,8 @@ def _is_non_causal_recovery(text: str) -> bool:
     clean = text.strip()
     if not clean:
         return False
+    if _is_unverified_fix(clean):
+        return True
 
     fix_match = re.search(r"(?i)\bverified fix:\s*use\s+`([^`\n]+)`", clean)
     if fix_match:
@@ -291,6 +309,113 @@ def _is_non_causal_recovery(text: str) -> bool:
                 if failed_tool.lower() != succeeded_tool.lower():
                     return True
     return False
+
+
+_VERIFIED_FIX_RULE_RE = re.compile(
+    r"`(?P<failed>[^`\n]+)`\s+failed with\s+`(?P<error>[^`\n]*)`\.?\s+"
+    r"Verified fix:\s*use\s+`(?P<fix>[^`\n]+)`",
+    re.IGNORECASE,
+)
+_RETRY_RULE_RE = re.compile(
+    r"`(?P<failed>[^`\n]+)`\s+failed with\s+`(?P<error>[^`\n]*)`;\s*retrying succeeded",
+    re.IGNORECASE,
+)
+_INVOKING_RULE_RE = re.compile(
+    r"\bInvoking\s+`[^`\n]+`\s+after the dependency failure resolved\b", re.IGNORECASE
+)
+_FAILED_WITH_RE = re.compile(r"failed with\s+`(?P<error>[^`\n]*)`", re.IGNORECASE)
+
+
+def _looks_like_path(text: str) -> bool:
+    value = (text or "").strip().strip("\"'")
+    if re.match(r"^[A-Za-z]:[\\/]", value):
+        return True
+    return " " not in value and bool(re.search(r"[\\/]", value)) and bool(
+        re.search(r"\.[A-Za-z0-9]{1,6}$", value)
+    )
+
+
+def _basename(text: str) -> str:
+    return re.split(r"[\\/]", (text or "").strip().strip("\"'"))[-1].casefold()
+
+
+def canonical_rule(text: str) -> str | None:
+    """Map a legacy per-command rule onto its error-class rule, if any."""
+    match = _VERIFIED_FIX_RULE_RE.search(text or "")
+    if match and is_inline_quoting_failure(match.group("failed"), match.group("error")):
+        return INLINE_QUOTING_RULE
+    return None
+
+
+def _is_unverified_fix(text: str) -> bool:
+    """True when rule text records a "fix" the recovery rules would reject.
+
+    Older versions paired any failure with the next success of the same
+    program, which produced rules such as "download_fonts.py failed (404);
+    use render_font_samples.py" or "hyperframes check printed `0 failed`;
+    use hyperframes render". These checks mirror the analyzer so stale rules
+    are removed instead of lingering in AGENTS.md.
+    """
+    clean = (text or "").strip()
+    if not clean:
+        return False
+    if canonical_rule(clean):
+        return False
+    error_match = _FAILED_WITH_RE.search(clean)
+    if error_match and is_benign_status(error_match.group("error")) and not re.search(
+        r"Traceback|Error\b|Exception\b", error_match.group("error")
+    ):
+        return True
+    if _INVOKING_RULE_RE.search(clean):
+        return True
+    retry = _RETRY_RULE_RE.search(clean)
+    if retry and not is_transient_error(retry.group("error")):
+        return True
+    fix = _VERIFIED_FIX_RULE_RE.search(clean)
+    if fix:
+        failed, error, command = fix.group("failed"), fix.group("error"), fix.group("fix")
+        if _looks_like_path(failed) and _looks_like_path(command):
+            if failed.endswith("…") or command.endswith("…"):
+                # Cut by the summary length limit; the basenames are unknown.
+                return False
+            return _basename(failed) != _basename(command)
+        if _looks_like_path(failed) != _looks_like_path(command):
+            # A file operation "fixed" by running a script, or the reverse.
+            return True
+        truncated = failed.endswith("…") or command.endswith("…")
+        if is_inline_code(command) and not is_inline_code(failed):
+            return True
+        if is_inline_code(failed):
+            # Throwaway one-liner that failed for a non-quoting reason.
+            return True
+        if not truncated and not is_causal_command_fix(failed, error, command):
+            return True
+        if truncated and not is_causal_command_fix(
+            failed.rstrip("…"), error, command.rstrip("…")
+        ):
+            return True
+    return False
+
+
+def is_surfaceable_lesson(lesson: dict[str, Any]) -> bool:
+    """Whether a stored lesson still passes the current learning gates.
+
+    Memory written by older versions holds "verified" lessons that the current
+    analyzer would reject (unrelated "fixes", status lines read as errors,
+    host markup as the error). Recall and briefings must not keep surfacing
+    them.
+    """
+    resolution = str(lesson.get("resolution") or "")
+    error = str(lesson.get("error_pattern") or lesson.get("error_message") or "")
+    if not resolution.strip():
+        return False
+    if re.fullmatch(r"\s*</?[A-Z][A-Z0-9_]{2,}>\s*", error):
+        return False
+    if is_benign_status(error) and not re.search(r"Traceback|Error\b|Exception\b", error):
+        return False
+    if _is_non_causal_recovery(resolution):
+        return False
+    return not contains_secret_strict(resolution + " " + error)
 
 
 def _is_standing_directive(text: str) -> bool:
@@ -314,6 +439,10 @@ def _is_standing_directive(text: str) -> bool:
     if lowered.startswith(_TASK_PREFIXES):
         return False
     if not any(marker in lowered for marker in _INVARIANT_MARKERS):
+        return False
+    if _ONE_OFF_RE.search(clean):
+        # "Never re render it from scratch" refers to one artifact in one
+        # conversation; out of context the rule is meaningless or wrong.
         return False
     has_task_verb = any(verb in lowered for verb in _TASK_VERBS)
     has_strong_marker = any(marker in lowered for marker in _STRONG_MARKERS)
@@ -549,11 +678,11 @@ def _clean_routing_item(text: str) -> str | None:
         return None
     if "<!-- HARNESS:" in clean or "HARNESS:AUTONOMOUS_RULES" in clean:
         return None
-    if contains_secret(clean):
+    if contains_secret_strict(clean):
         return None
     if clean.startswith(("- ", "* ", "+ ")):
         clean = clean[2:].strip()
-    return redact(clean)
+    return redact_strict(clean)
 
 
 def sanitize_rule(text: str, global_scope: bool = False) -> str | None:
@@ -569,7 +698,7 @@ def sanitize_rule(text: str, global_scope: bool = False) -> str | None:
         return None
     if "\ufffd" in clean or "�" in clean:
         return None
-    if contains_secret(original):
+    if contains_secret_strict(original):
         return None
     if clean.lower().startswith(("http://", "https://")):
         return None
@@ -597,7 +726,7 @@ def sanitize_rule(text: str, global_scope: bool = False) -> str | None:
                 return None
         if any(word in lowered for word in _GLOBAL_UNSAFE_WORDS):
             return None
-    return redact(clean)
+    return redact_strict(clean)
 
 
 def is_global_safe(text: str) -> bool:
@@ -1011,6 +1140,23 @@ class AgentsMdManager:
             existing.routing.extend(parsed.routing)
         existing = existing.compact()
         previously_managed = existing.compact()
+        # Rules written by an older, laxer version are re-checked on every
+        # update, so one Stop is enough to clean a polluted block.
+        existing = RuleSet(
+            directives=[
+                rule for rule in existing.directives
+                if self._still_valid(rule, "directive", is_workspace)
+            ],
+            quirks=[
+                rule for rule in existing.quirks
+                if self._still_valid(rule, "quirk", is_workspace)
+            ],
+            pitfalls=[
+                rule for rule in existing.pitfalls
+                if self._still_valid(rule, "pitfall", is_workspace)
+            ],
+            routing=list(existing.routing),
+        )
 
         warnings: list[str] = []
         superseded: list[str] = []
@@ -1039,9 +1185,9 @@ class AgentsMdManager:
 
         user_rules = self._bullet_lines(user_content)
         candidate = RuleSet(
-            directives=self._merge(existing.directives, new_rules.directives, user_rules),
-            quirks=self._merge(existing.quirks, new_rules.quirks, user_rules),
-            pitfalls=self._merge(existing.pitfalls, new_rules.pitfalls, user_rules),
+            directives=self._merge(existing.directives, new_rules.directives, user_rules, user_content),
+            quirks=self._merge(existing.quirks, new_rules.quirks, user_rules, user_content),
+            pitfalls=self._merge(existing.pitfalls, new_rules.pitfalls, user_rules, user_content),
             routing=self._merge(existing.routing, new_rules.routing, user_rules),
         ).compact()
 
@@ -1137,26 +1283,17 @@ class AgentsMdManager:
                 block, global_scope=not is_workspace, compact=False
             )
             before += len(block_rules.all())
-            parsed.directives.extend(
-                rule
-                for rule in block_rules.directives
-                if _is_standing_directive(rule)
-                and not _is_self_referential(rule)
-                and not _is_non_causal_recovery(rule)
-            )
-            parsed.quirks.extend(
-                rule
-                for rule in block_rules.quirks
-                if not _is_self_referential(rule)
-                and not _is_non_causal_recovery(rule)
-            )
-            parsed.pitfalls.extend(
-                rule
-                for rule in block_rules.pitfalls
-                if not _is_self_referential(rule)
-                and not _is_non_causal_recovery(rule)
-                and (not is_workspace or not self._mentions_foreign_path(rule))
-            )
+            for section, source, sink in (
+                ("directive", block_rules.directives, parsed.directives),
+                ("quirk", block_rules.quirks, parsed.quirks),
+                ("pitfall", block_rules.pitfalls, parsed.pitfalls),
+            ):
+                sink.extend(
+                    rule
+                    for rule in source
+                    if self._still_valid(rule, section, is_workspace)
+                    and not self._covered_by_user(rule, user_content)
+                )
             parsed.routing.extend(
                 item for item in block_rules.routing if _clean_routing_item(item)
             )
@@ -1182,15 +1319,42 @@ class AgentsMdManager:
             "warnings": warnings,
         }
 
+    def _still_valid(self, rule: str, section: str, is_workspace: bool) -> bool:
+        """Apply the current learning gates to a rule that is already stored."""
+        if _is_self_referential(rule) or _is_non_causal_recovery(rule):
+            return False
+        if section == "directive":
+            # The global file ships curated directives ("Use the harness CLI
+            # ...") that are deliberately not phrased as always/never rules.
+            # Only workspace directives were learned from chat.
+            return not is_workspace or _is_standing_directive(rule)
+        if section == "pitfall" and is_workspace and self._mentions_foreign_path(rule):
+            return False
+        return True
+
+    @staticmethod
+    def _covered_by_user(item: str, user_text: str) -> bool:
+        """The user's own section already states this lesson."""
+        if not user_text:
+            return False
+        if item == INLINE_QUOTING_RULE:
+            return bool(
+                re.search(r"(?i)(?:python|py)\s+-c\b|inline\s+`?python|node\s+-e\b", user_text)
+            )
+        return False
+
     def _merge(
         self,
         existing: Sequence[str],
         new_items: Sequence[str],
         user_rules: Sequence[str],
+        user_text: str = "",
     ) -> list[str]:
-        merged = list(existing)
+        merged = [item for item in existing if not self._covered_by_user(item, user_text)]
         for item in new_items:
             if any(jaccard(item, user_rule, keep_code=True) >= 0.82 for user_rule in user_rules):
+                continue
+            if self._covered_by_user(item, user_text):
                 continue
             merged.append(item)
         # Deduplicate once at the end. Deduplicating after every append is
@@ -1257,7 +1421,12 @@ class AgentsMdManager:
                     continue
                 rule = sanitize_rule(line[2:].strip(), global_scope=global_scope)
                 if rule and current is not None:
-                    current.append(rule)
+                    canonical = canonical_rule(rule)
+                    if canonical:
+                        # Collapse per-command quoting rules into one.
+                        data.pitfalls.append(canonical)
+                    else:
+                        current.append(rule)
                 continue
             if current is data.routing:
                 continue
@@ -1404,9 +1573,5 @@ class AgentsMdManager:
         """True when a rule cites an absolute path outside this workspace."""
         if not self.workspace_path:
             return False
-        root = str(Path(self.workspace_path).resolve()).lower().replace("/", "\\").rstrip("\\")
-        for match in re.findall(r"[A-Za-z]:\\[^\s`\"'<>|)]+", text or ""):
-            normalized = re.sub(r"\\+", r"\\", match).lower()
-            if not normalized.startswith(root):
-                return True
-        return False
+        root = path_root_key(self.workspace_path)
+        return bool(foreign_windows_paths(text or "", root, ignore_tooling=True))

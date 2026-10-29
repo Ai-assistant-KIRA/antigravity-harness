@@ -30,11 +30,27 @@ from .config import (
     get_workspace_tools_path,
     tokenize,
 )
-from .redaction import redact
+from .memory_store import MemoryStore, enrich_skills_with_usage, is_retired_skill
+from .redaction import redact, redact_strict
 from .settings import get_setting, load_settings
 from .skill_builder import SkillBuilder
 from .trust import scan_text
-from .util import one_line
+from .util import one_line, strip_paths
+
+# Words that appear in most requests and match most skill descriptions. They
+# must not make an unrelated skill look relevant.
+_ROUTING_STOPWORDS = frozenset(
+    {
+        "the", "and", "for", "with", "this", "that", "from", "into", "our", "your",
+        "use", "using", "when", "task", "involves", "make", "made", "want", "need",
+        "please", "can", "you", "all", "any", "new", "get", "set", "run", "add",
+        "now", "also", "just", "like", "both", "them", "they", "its", "has",
+        "have", "will", "should", "would", "could", "about", "then", "than",
+        "repeatable", "procedure", "verified", "step", "steps", "project",
+        "file", "files", "work", "editor", "user", "skill", "skills",
+    }
+)
+MIN_SKILL_OVERLAP = 2
 
 _TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_.:-]{2,80}$")
 
@@ -106,7 +122,9 @@ TOOL_CATALOG: tuple[dict[str, Any], ...] = (
     {
         "name": "run_extension",
         "description": "Run a configured editor or Antigravity extension.",
-        "signals": ("extension plugin editor ide run extension",),
+        # Only an explicit mention of an extension. "plugin", "editor" and
+        # "run" matched nearly every request in a plugin or video-editor repo.
+        "signals": ("extension", "vs code extension", "ide extension"),
     },
     {
         "name": "generate_image",
@@ -120,8 +138,20 @@ _MAX_DESCRIPTION = 140
 
 
 def _safe_task_text(text: str, limit: int = 160) -> str:
-    """Make a user request safe to persist in a project rule file."""
-    raw = one_line(redact(str(text or "")), limit).strip()
+    """Make a user request safe to persist in a project rule file.
+
+    Absolute paths and credentials are removed rather than masked: the task
+    line is a short summary, and a pasted API key or a user's file path does
+    not belong in a committed AGENTS.md.
+    """
+    cleaned = redact_strict(str(text or ""))
+    cleaned = re.sub(r"\S*\[REDACTED\]\S*", " ", cleaned)
+    cleaned = strip_paths(cleaned)
+    # Tails of paths whose folder names contain spaces ("video editor\x.mp4")
+    # and quotes orphaned by the removal.
+    cleaned = re.sub(r"\S*[\\/]\S*", " ", cleaned)
+    cleaned = re.sub(r"(?<!\w)[\"'](?!\w)", " ", cleaned)
+    raw = one_line(cleaned, limit).strip(" ,;:-\"'")
     if not raw:
         return ""
     if "<!-- HARNESS:" in raw or "HARNESS:AUTONOMOUS_RULES" in raw:
@@ -258,7 +288,14 @@ class TaskRouter:
             except (OSError, ValueError):
                 continue
             skills.append(skill)
-        return skills
+        try:
+            store = MemoryStore(workspace=self.workspace_path)
+            skills = enrich_skills_with_usage(
+                skills, store.get_all_skills(self.workspace_path), store.project
+            )
+        except Exception:
+            pass
+        return [skill for skill in skills if not is_retired_skill(skill)]
 
     def declared_tools(self) -> list[dict[str, Any]]:
         """Optional project tool declarations from ``.agents/tools.json``."""
@@ -318,17 +355,25 @@ class TaskRouter:
             # A refresh keeps the inventory current without inventing a task.
             return selection
 
-        tokens = set(tokenize(clean_task))
-        for signal in signals:
-            tokens.update(tokenize(signal))
+        # Relevance comes from the request alone. Project signals ("video",
+        # "python") and quality used to be enough to route every skill to
+        # every task; they now only rank skills that already match.
+        tokens = {
+            token for token in tokenize(clean_task)
+            if len(token) >= 3 and token not in _ROUTING_STOPWORDS
+        }
         lowered = clean_task.casefold()
 
         scored_skills: list[tuple[float, dict[str, Any]]] = []
         for skill in skill_records:
-            text = f"{skill.get('name', '')} {skill.get('description', '')}"
+            name = str(skill.get("name") or "")
+            text = f"{name} {skill.get('description', '')}"
             text_tokens = set(tokenize(text))
             overlap = len(tokens & text_tokens)
-            score = float(overlap * 3)
+            name_hit = bool(tokens & set(tokenize(name.replace("-", " "))))
+            if overlap < MIN_SKILL_OVERLAP and not (name_hit and overlap >= 1):
+                continue
+            score = float(overlap * 3) + (2.0 if name_hit else 0.0)
             for signal in signals:
                 if signal and signal.casefold() in text.casefold():
                     score += 1.5
@@ -336,8 +381,7 @@ class TaskRouter:
             score += min(5, int(skill.get("reused_count") or 0)) * 0.2
             if skill.get("managed"):
                 score += 0.5
-            if score > 0 and overlap + (1 if score >= 4 else 0) >= 1:
-                scored_skills.append((score, skill))
+            scored_skills.append((score, skill))
         scored_skills.sort(key=lambda item: (-item[0], item[1].get("name", "")))
         selection.skills = [
             skill for _score, skill in scored_skills[: self.max_skills]
@@ -347,10 +391,13 @@ class TaskRouter:
         scored_tools: list[tuple[float, dict[str, Any]]] = []
         for tool in catalog:
             name = str(tool.get("name") or "")
-            text = " ".join(
-                [name, str(tool.get("description") or "")]
-                + [str(item) for item in tool.get("signals") or ()]
-            )
+            # Built-in tools match on their curated signals, not their prose
+            # description ("Antigravity extension" matched every Antigravity
+            # task). Declared tools may only have a description.
+            parts = [name] + [str(item) for item in tool.get("signals") or ()]
+            if tool.get("declared") or not tool.get("signals"):
+                parts.append(str(tool.get("description") or ""))
+            text = " ".join(parts)
             text_tokens = set(tokenize(text))
             score = float(len(tokens & text_tokens) * 3)
             if name.casefold() in lowered:

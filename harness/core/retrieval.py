@@ -30,7 +30,8 @@ from .config import (
     safe_conversation_id,
     tokenize,
 )
-from .memory_store import MemoryStore
+from .agents_md_manager import is_surfaceable_lesson
+from .memory_store import MemoryStore, enrich_skills_with_usage, is_retired_skill
 from .redaction import redact
 from .router import TaskRouter
 from .skill_builder import SkillBuilder
@@ -228,6 +229,8 @@ def find_recall(
         overlap = len(query_tokens & _tokens(text))
         if overlap <= 0:
             continue
+        if not is_surfaceable_lesson(lesson):
+            continue
         if not _trusted(text):
             continue
         enriched = dict(lesson)
@@ -247,10 +250,18 @@ def find_recall(
             )
         except Exception:
             installed = []
+        try:
+            installed = enrich_skills_with_usage(
+                installed, store.get_all_skills(workspace), store.project
+            )
+        except Exception:
+            pass
         for skill in installed:
             if not skill.get("valid", True):
                 continue
             if project_skills_only() and skill.get("scope") != "workspace":
+                continue
+            if is_retired_skill(skill):
                 continue
             text = f"{skill.get('name', '')} {skill.get('description', '')}"
             overlap = len(query_tokens & _tokens(text))

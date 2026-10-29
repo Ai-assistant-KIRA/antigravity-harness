@@ -17,7 +17,8 @@ from .config import (
     get_workspace_rules_path,
     project_skills_only,
 )
-from .memory_store import MemoryStore
+from .agents_md_manager import is_surfaceable_lesson
+from .memory_store import MemoryStore, is_retired_skill
 from .settings import get_setting, load_settings
 from .skill_builder import SkillBuilder
 from .util import one_line, truncate
@@ -246,6 +247,10 @@ class SessionLoader:
                 enriched["last_used_at"] = record.get("last_used_at")
                 enriched["updated_at"] = record.get("updated_at")
             enriched["quality"] = quality
+            if is_retired_skill(enriched):
+                # Offered many times, never loaded: stop spending briefing
+                # space on it.
+                continue
             skills.append(enriched)
 
         signal_tokens = {signal.lower() for signal in signals}
@@ -273,17 +278,27 @@ class SessionLoader:
         query = " ".join(signals)
         if self.max_lessons <= 0:
             return []
+        # Over-fetch, then drop stored lessons the current gates reject.
+        fetch = self.max_lessons * 3
         if query:
-            lessons = self.memory_store.search_lessons(
-                query,
-                limit=self.max_lessons,
+            lessons = [
+                lesson
+                for lesson in self.memory_store.search_lessons(
+                    query,
+                    limit=fetch,
+                    workspace=workspace,
+                    verified_only=True,
+                )
+                if is_surfaceable_lesson(lesson)
+            ]
+            if lessons:
+                return lessons[: self.max_lessons]
+        return [
+            lesson
+            for lesson in self.memory_store.get_recent_lessons(
+                limit=fetch,
                 workspace=workspace,
                 verified_only=True,
             )
-            if lessons:
-                return lessons
-        return self.memory_store.get_recent_lessons(
-            limit=self.max_lessons,
-            workspace=workspace,
-            verified_only=True,
-        )
+            if is_surfaceable_lesson(lesson)
+        ][: self.max_lessons]

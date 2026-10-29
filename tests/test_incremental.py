@@ -16,6 +16,7 @@ from harness.core.engine import HarnessEngine
 from harness.core.incremental import (
     CONTEXT_LIMIT_BYTES,
     CONTEXT_LIMIT_STEPS,
+    STEP_STRING_LIMIT,
     cursor_path,
     load_cursor,
     read_incremental,
@@ -246,14 +247,29 @@ class TestIncrementalReader(IsolatedHarnessTestCase):
             "bytes.jsonl", [user(f"Large {index} {large}") for index in range(6)]
         )
         read = read_incremental(transcript, conversation_id="conv-bytes")
-        self.assertTrue(read.context_truncated)
-        # The full read still analyses all six steps; only the pairing context
-        # is byte-bounded.
+        # The full read still analyses all six steps at full size; only the
+        # stored pairing context is bounded.
         self.assertEqual(len(read.steps), 6)
-        self.assertLess(len(read.cursor.context), 6)
+        self.assertEqual(len(read.steps[-1]["content"]), len(f"Large 5 {large}"))
         serialized = json.dumps(read.cursor.context, ensure_ascii=False)
         self.assertLessEqual(len(serialized.encode("utf-8")), CONTEXT_LIMIT_BYTES)
-        self.assertEqual(read.steps[-1], read.cursor.context[-1])
+        # Long strings keep their head and tail, so a traceback's final
+        # exception line survives.
+        stored = read.cursor.context[-1]["content"]
+        self.assertLessEqual(len(stored), STEP_STRING_LIMIT + 8)
+        self.assertTrue(stored.startswith("Large 5 "))
+        self.assertTrue(stored.endswith("x"))
+
+    def test_cursor_context_is_redacted(self) -> None:
+        secret = "sk_" + "a1b2c3d4e5" * 4
+        transcript = self.make_transcript(
+            "secret.jsonl", [user(f"set up elevenlabs with {secret} please")]
+        )
+        read = read_incremental(transcript, conversation_id="conv-secret")
+        read.save()
+        stored = cursor_path("conv-secret", transcript).read_text(encoding="utf-8")
+        self.assertNotIn(secret, stored)
+        self.assertIn("[REDACTED]", stored)
 
     def test_cursor_is_conversation_and_transcript_scoped(self) -> None:
         first_transcript = self.make_transcript("scoped-a.jsonl", [user("Alpha")])
