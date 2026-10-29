@@ -1,0 +1,17 @@
+# Normalise line endings in the repository; check out per platform needs.
+* text=auto eol=lf
+
+# cmd.exe misreads labels and `goto` in LF-only batch files.
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# POSIX launchers must stay LF even on a Windows checkout.
+*.sh  text eol=lf
+bin/hook    text eol=lf
+bin/harness text eol=lf
+
+*.png binary
+*.jpg binary
+*.ico binary
+*.db  binary

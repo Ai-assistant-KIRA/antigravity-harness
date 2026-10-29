@@ -511,6 +511,50 @@ def _rewrite_deployed_hooks(target: Path, dry_run: bool) -> list[str]:
     return []
 
 
+def _record_interpreter(target: Path, dry_run: bool) -> None:
+    """Pin the interpreter that ran the installer for the hook launchers.
+
+    Without it, every hook call on Windows spawned `where py`, then `py.exe`,
+    then Python: about 100 ms of process start-up on each tool call. The
+    launchers fall back to the PATH search if this interpreter disappears.
+    """
+    _log(f"  - record interpreter {sys.executable}", dry_run)
+    if dry_run:
+        return
+    path = target / "bin" / "python.path"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(str(Path(sys.executable).resolve()) + "\n", encoding="utf-8")
+    except OSError as exc:
+        _log(f"    (could not record interpreter: {exc})")
+
+
+def _normalize_launcher_newlines(target: Path, dry_run: bool) -> None:
+    """Give each launcher the line endings its shell needs.
+
+    A ZIP download or a checkout with unusual git settings can deliver
+    LF-only batch files (cmd.exe then misreads `goto` labels) or CRLF shell
+    scripts (`sh` then fails with `$'\\r': command not found`).
+    """
+    if dry_run:
+        return
+    bin_dir = target / "bin"
+    wanted = {"\r\n": [*bin_dir.glob("*.cmd")], "\n": [bin_dir / "hook", bin_dir / "harness"]}
+    for newline, paths in wanted.items():
+        for path in paths:
+            if not path.is_file():
+                continue
+            try:
+                raw = path.read_bytes()
+                normalized = raw.replace(b"\r\n", b"\n")
+                if newline == "\r\n":
+                    normalized = normalized.replace(b"\n", b"\r\n")
+                if normalized != raw:
+                    path.write_bytes(normalized)
+            except OSError:
+                continue
+
+
 def _ensure_launcher_permissions(target: Path, dry_run: bool) -> None:
     """Keep the POSIX launcher executable even if the checkout mode was lost."""
     if dry_run or os.name == "nt":
@@ -669,6 +713,50 @@ def _find_hook_command(hooks: object, event: str) -> tuple[str, int | None]:
                                 timeout if isinstance(timeout, (int, float)) else None,
                             )
     return "", None
+
+
+def _scrub_state(target: Path) -> list[str]:
+    """Re-redact transcript cursors written by an older version.
+
+    Cursors before v2.3 stored raw transcript steps, including credentials
+    pasted into prompts. The deployed code does the work so the rules match
+    exactly what the hooks will use.
+    """
+    if not (target / "state" / "transcript_cursors").is_dir():
+        return []
+    env = dict(os.environ)
+    env["HARNESS_PLUGIN_DIR"] = str(target)
+    env["PYTHONIOENCODING"] = "utf-8"
+    code = (
+        "import json, sys; sys.path.insert(0, sys.argv[1]); "
+        "from harness.core.incremental import scrub_cursor_files; "
+        "print(json.dumps(scrub_cursor_files()))"
+    )
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-X", "utf8", "-c", code, str(target)],
+            cwd=str(target),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=120,
+            env=env,
+        )
+    except Exception as exc:
+        return [f"cursor scrub could not run: {exc}"]
+    if completed.returncode != 0:
+        return [f"cursor scrub failed: {completed.stderr[-300:]}"]
+    try:
+        stats = json.loads(completed.stdout.strip() or "{}")
+    except json.JSONDecodeError:
+        stats = {}
+    if stats.get("rewritten") or stats.get("removed"):
+        print(
+            f"  - scrubbed transcript cursors: {stats.get('rewritten', 0)} rewritten, "
+            f"{stats.get('removed', 0)} removed"
+        )
+    return []
 
 
 def _smoke_test(target: Path) -> list[str]:
@@ -845,13 +933,20 @@ def install(
     problem = _target_problem(target)
     if problem:
         print(f"Error: {problem}.")
+        if "source checkout" in problem:
+            print(
+                "  Clone the repository somewhere else (for example a temporary folder) "
+                "and run the installer from there; it copies the plugin into the target."
+            )
+        _set_status_reason(problem)
         return 2
-    print(f"Deploying Harness² to: {target}")
+    print(f"Deploying Harness² v{_source_version()} to: {target}")
 
     try:
         backup, backup_problems = _backup(target, dry_run)
     except (OSError, shutil.Error) as exc:
         print(f"Error: backup failed ({exc}); nothing was changed.")
+        _set_status_reason(f"backup failed: {exc}")
         return 2
     if backup is not None and not backup_problems:
         _prune_backups(target, keep_backups, backup, dry_run)
@@ -879,7 +974,9 @@ def install(
         (target / "memory").mkdir(exist_ok=True)
         (target / "state").mkdir(exist_ok=True)
 
+    _normalize_launcher_newlines(target, dry_run)
     _ensure_launcher_permissions(target, dry_run)
+    _record_interpreter(target, dry_run)
     rewrite_problems = _rewrite_deployed_hooks(target, dry_run)
 
     if dry_run:
@@ -889,19 +986,97 @@ def install(
     problems = list(backup_problems)
     problems.extend(rewrite_problems)
     problems.extend(_validate(target))
+    problems.extend(_scrub_state(target))
     problems.extend(_smoke_test(target))
+    doctor_problems, doctor_notes = _post_install_doctor(target)
+    problems.extend(doctor_problems)
     if problems:
         print("\n[WARNING] Deployment completed with problems:")
         for problem in problems:
             print(f"  - {problem}")
         print(f"Backup: {backup}" if backup else "")
+        _set_status_reason(problems[0])
         return 1
 
-    print(f"\n[SUCCESS] Harness² v{_source_version()} deployed and smoke-tested.")
+    print(f"\n[SUCCESS] Harness² v{_source_version()} deployed, smoke-tested, and checked.")
+    for note in doctor_notes:
+        print(f"  note: {note}")
     if backup:
         print(f"Backup: {backup}")
-    print("Next: restart Antigravity, then run `harness doctor`.")
+    print(
+        "Next: restart Antigravity (quit it fully and reopen) so it loads the plugin hooks."
+    )
     return 0
+
+
+def _post_install_doctor(target: Path) -> tuple[list[str], list[str]]:
+    """Run the deployed `harness doctor --json`.
+
+    Critical checks (manifest, hooks, runner, Python) fail the install.
+    Anything else, such as learning history from an older version or an
+    invalid hand-written skill, is reported as a note: the deployment itself
+    is fine and the doctor output explains what to look at.
+    """
+    cli = target / "scripts" / "harness_cli.py"
+    if not cli.exists():
+        return [f"missing {cli}"], []
+    env = dict(os.environ)
+    env["HARNESS_PLUGIN_DIR"] = str(target)
+    env["PYTHONIOENCODING"] = "utf-8"
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-X", "utf8", str(cli), "doctor", "--json"],
+            cwd=str(target),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=120,
+            env=env,
+        )
+    except Exception as exc:
+        return [f"doctor could not run: {exc}"], []
+    try:
+        report = json.loads(completed.stdout.strip() or "{}")
+    except json.JSONDecodeError:
+        return [f"doctor did not return JSON: {completed.stderr[-300:] or completed.stdout[:200]}"], []
+    checks = report.get("checks") if isinstance(report, dict) else None
+    if not isinstance(checks, list):
+        return ["doctor returned no checks"], []
+    critical = [
+        f"doctor: {item.get('check')}: {item.get('detail')}"
+        for item in checks
+        if isinstance(item, dict) and not item.get("ok") and item.get("critical")
+    ]
+    notes = [
+        f"doctor: {item.get('check')}: {item.get('detail')}"
+        for item in checks
+        if isinstance(item, dict) and not item.get("ok") and not item.get("critical")
+    ]
+    _log(f"  - doctor: {sum(1 for item in checks if item.get('ok'))}/{len(checks)} checks passed")
+    return critical, notes
+
+
+# The final line of every run is machine-readable so an agent driving the
+# install can tell success from failure without parsing prose.
+_STATUS = {"reason": ""}
+
+
+def _set_status_reason(reason: str) -> None:
+    if not _STATUS["reason"]:
+        _STATUS["reason"] = " ".join(str(reason).split())[:300]
+
+
+def _print_status(code: int, action: str, target: Path, dry_run: bool) -> None:
+    if code == 0:
+        mode = " dry_run=true" if dry_run else ""
+        print(
+            f"HARNESS_INSTALL: ok action={action} version={_source_version()} "
+            f"target={target.expanduser().resolve()}{mode}"
+        )
+    else:
+        reason = _STATUS["reason"] or f"exit code {code}; see the output above"
+        print(f"HARNESS_INSTALL: failed action={action} reason={reason}")
 
 
 def _positive_int(value: str) -> int:
@@ -946,19 +1121,27 @@ def main() -> None:
     if args.force and (args.uninstall or args.rollback):
         parser.error("--force cannot be combined with --uninstall or --rollback")
 
+    if sys.version_info < (3, 10):
+        print(f"Error: Harness² needs Python 3.10 or newer; this is {sys.version.split()[0]}.")
+        _set_status_reason("Python 3.10 or newer is required")
+        _print_status(2, "install", args.target, args.dry_run)
+        sys.exit(2)
+
     if args.uninstall:
-        sys.exit(uninstall(args.target, args.dry_run, args.keep_backups))
-    if args.rollback:
-        sys.exit(rollback(args.target, args.dry_run, args.keep_backups))
-    sys.exit(
-        install(
+        action, code = "uninstall", uninstall(args.target, args.dry_run, args.keep_backups)
+    elif args.rollback:
+        action, code = "rollback", rollback(args.target, args.dry_run, args.keep_backups)
+    else:
+        action = "install"
+        code = install(
             args.target,
             args.force,
             args.reset,
             args.dry_run,
             keep_backups=args.keep_backups,
         )
-    )
+    _print_status(code, action, args.target, args.dry_run)
+    sys.exit(code)
 
 
 if __name__ == "__main__":
