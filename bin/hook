@@ -1,11 +1,19 @@
 #!/usr/bin/env sh
 # Harness² hook launcher. Resolves the plugin root from this script so it
-# works from any working directory, then prefers python3.
+# works from any working directory. Uses the interpreter recorded at install
+# time (bin/python.path) when it still exists, then python3, then python.
+# HARNESS_PYTHON overrides all of them.
 set -u
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 HARNESS_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 HARNESS_RUNNER="$HARNESS_ROOT/scripts/hook_runner.py"
 
+if [ -z "${HARNESS_PYTHON:-}" ] && [ -f "$SCRIPT_DIR/python.path" ]; then
+    HARNESS_PYTHON=$(head -n 1 "$SCRIPT_DIR/python.path")
+fi
+if [ -n "${HARNESS_PYTHON:-}" ] && [ -x "$HARNESS_PYTHON" ]; then
+    exec "$HARNESS_PYTHON" -X utf8 "$HARNESS_RUNNER" "$@"
+fi
 if command -v python3 >/dev/null 2>&1; then
     exec python3 -X utf8 "$HARNESS_RUNNER" "$@"
 fi
