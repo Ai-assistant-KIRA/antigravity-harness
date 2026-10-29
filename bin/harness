@@ -2,7 +2,7 @@
 # Harness² CLI wrapper. Works from any working directory.
 # Uses the interpreter recorded at install time (bin/python.path) when it still
 # exists, then python3. HARNESS_PYTHON (or the older PYTHON) overrides both.
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 HARNESS_PYTHON=${HARNESS_PYTHON:-${PYTHON:-}}
 if [ -z "$HARNESS_PYTHON" ] && [ -f "$SCRIPT_DIR/python.path" ]; then
     HARNESS_PYTHON=$(head -n 1 "$SCRIPT_DIR/python.path")

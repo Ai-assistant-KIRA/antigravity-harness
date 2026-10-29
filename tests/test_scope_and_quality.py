@@ -31,10 +31,12 @@ def session_steps(path: str) -> list[dict]:
 class TestWorkspaceScope(IsolatedHarnessTestCase):
     def test_conversation_binding_survives_missing_workspace_paths(self) -> None:
         bind_conversation_workspace("conv-bound", self.workspace)
-        self.assertEqual(get_bound_workspace("conv-bound"), self.workspace)
+        # Compare resolved paths: Windows runners hand out 8.3 temp paths
+        # (RUNNER~1) while the binding stores the long form.
+        self.assertEqual(get_bound_workspace("conv-bound").resolve(), self.workspace.resolve())
 
         resolved = hooks._resolve_workspace({"conversationId": "conv-bound"})
-        self.assertEqual(resolved, self.workspace)
+        self.assertEqual(resolved.resolve(), self.workspace.resolve())
 
     def test_unbound_conversation_never_falls_back_to_cwd(self) -> None:
         self.assertEqual(hooks._resolve_workspace({"conversationId": "conv-unbound"}), None)
@@ -44,7 +46,7 @@ class TestWorkspaceScope(IsolatedHarnessTestCase):
         hooks._resolve_workspace(
             {"conversationId": "conv-payload", "workspacePaths": [str(self.workspace)]}
         )
-        self.assertEqual(get_bound_workspace("conv-payload"), self.workspace)
+        self.assertEqual(get_bound_workspace("conv-payload").resolve(), self.workspace.resolve())
 
     def test_foreign_transcript_writes_nothing(self) -> None:
         engine = HarnessEngine(self.workspace)

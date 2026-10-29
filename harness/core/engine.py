@@ -47,7 +47,7 @@ from .util import (
     hash_steps,
     iter_strings,
     one_line,
-    path_root_key,
+    path_root_keys,
     text_mentions_root,
     truncate,
 )
@@ -464,8 +464,9 @@ class HarnessEngine:
         return path.resolve()
 
     @staticmethod
-    def _root_prefix(workspace: Path | str) -> str:
-        return path_root_key(workspace)
+    def _root_prefix(workspace: Path | str) -> tuple[str, ...]:
+        # Long and 8.3 short spellings of the same folder both count.
+        return path_root_keys(workspace)
 
     def _steps_belong_to_workspace(
         self,

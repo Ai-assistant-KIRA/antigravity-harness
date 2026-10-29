@@ -28,7 +28,7 @@ from harness.core.recovery import INLINE_QUOTING_RULE, INLINE_QUOTING_SIGNATURE
 from harness.core.redaction import redact, redact_strict
 from harness.core.router import TaskRouter, _safe_task_text
 from harness.core.skill_builder import SkillBuilder
-from harness.core.util import foreign_windows_paths, path_root_key, text_mentions_root
+from harness.core.util import foreign_windows_paths, path_root_keys, text_mentions_root
 from support import IsolatedHarnessTestCase, make_event, make_workflow
 
 FAKE_HEX_KEY = "0123456789abcdef0123456789abcdef"
@@ -85,15 +85,32 @@ class TestWorkspaceWithSpaces(IsolatedHarnessTestCase):
         self.assertEqual(result.conversation_id, "conv-space")
 
     def test_root_with_space_is_matched_at_the_path_position(self) -> None:
-        root = path_root_key(self.space_ws)
+        roots = path_root_keys(self.space_ws)
         inside = str(self.space_ws / "scratch" / "x.py")
-        self.assertTrue(text_mentions_root(f'run "{inside}" now', root))
+        self.assertTrue(text_mentions_root(f'run "{inside}" now', roots))
         sibling = str(self.space_ws) + "-old" + os.sep + "x.py"
-        self.assertFalse(text_mentions_root(sibling, root))
+        self.assertFalse(text_mentions_root(sibling, roots))
+
+    @unittest.skipUnless(os.name == "nt", "8.3 short names are a Windows feature")
+    def test_long_and_short_spellings_of_the_root_both_match(self) -> None:
+        import ctypes
+
+        buffer = ctypes.create_unicode_buffer(1024)
+        if not ctypes.windll.kernel32.GetShortPathNameW(str(self.space_ws), buffer, 1024):
+            self.skipTest("short names are unavailable on this volume")
+        short, long_form = buffer.value, str(self.space_ws.resolve())
+        if short.lower() == long_form.lower():
+            self.skipTest("8.3 name generation is disabled on this volume")
+        for spelling in (short, long_form):
+            for written in (spelling, long_form if spelling == short else short):
+                roots = path_root_keys(spelling)
+                self.assertTrue(
+                    text_mentions_root(f'"{written}\\work\\a.py"', roots), (spelling, written)
+                )
 
     @unittest.skipUnless(os.name == "nt", "Windows drive paths")
     def test_json_escapes_are_not_drive_letters(self) -> None:
-        root = path_root_key(self.space_ws)
+        root = path_root_keys(self.space_ws)
         self.assertEqual(foreign_windows_paths("task:\\n- step", root), [])
         self.assertEqual(foreign_windows_paths("task:\n- step", root), [])
 

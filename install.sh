@@ -50,7 +50,7 @@ say "using $("$PYTHON" -c 'import sys; print("Python %d.%d at %s" % (sys.version
 # A script piped into sh has no file of its own; $0 is the shell.
 SCRIPT_DIR=""
 case "$0" in
-    */install.sh|install.sh) SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) ;;
+    */install.sh|install.sh) SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd) ;;
 esac
 
 CLEANUP=""

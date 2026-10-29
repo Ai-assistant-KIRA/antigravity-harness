@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import os
@@ -12,7 +13,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Sequence
 
 
 def utc_now() -> datetime:
@@ -341,40 +342,88 @@ def path_root_key(root: Path | str) -> str:
     return normalize_path_text(resolved).rstrip("\\")
 
 
-def path_starts_with_root(text: str, start: int, root_key: str) -> bool:
+def path_root_keys(root: Path | str) -> tuple[str, ...]:
+    """Every spelling of a workspace root that may appear in a transcript.
+
+    On Windows the same folder can be written in its long form or as an 8.3
+    short name (``C:\\Users\\RUNNER~1\\...``). Resolving gives the long form, so
+    the unresolved absolute spelling is kept as well.
+    """
+    keys = [path_root_key(root)]
+    try:
+        absolute = os.path.abspath(str(root))
+    except (OSError, ValueError):
+        absolute = ""
+    for spelling in (absolute, *_windows_spellings(absolute)):
+        key = normalize_path_text(spelling).rstrip("\\")
+        if key and key not in keys:
+            keys.append(key)
+    return tuple(keys)
+
+
+@functools.lru_cache(maxsize=64)
+def _windows_spellings(path: str) -> tuple[str, ...]:
+    """The 8.3 short and the long form of an existing Windows path."""
+    if os.name != "nt" or not path:
+        return ()
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        found: list[str] = []
+        for function in (kernel32.GetShortPathNameW, kernel32.GetLongPathNameW):
+            buffer = ctypes.create_unicode_buffer(1024)
+            if function(path, buffer, len(buffer)) and buffer.value:
+                found.append(buffer.value)
+        return tuple(found)
+    except Exception:
+        return ()
+
+
+def _as_keys(root_key: str | Sequence[str]) -> tuple[str, ...]:
+    """Accept one root key or several spellings of the same root."""
+    if isinstance(root_key, str):
+        return (root_key,) if root_key else ()
+    return tuple(key for key in root_key if key)
+
+
+def path_starts_with_root(text: str, start: int, root_key: str | Sequence[str]) -> bool:
     """True when ``text[start:]`` begins with the workspace root.
 
     The comparison happens on the original text, so spaces and apostrophes in
     the root are honoured. The character after the root must end the folder
     name, so ``video editor-old`` is not inside ``video editor``.
     """
-    if not root_key:
-        return False
-    window = normalize_path_text(text[start : start + 2 * len(root_key) + 16])
-    if not window.startswith(root_key):
-        return False
-    following = window[len(root_key) : len(root_key) + 1]
-    return not following or not (following.isalnum() or following in "_-.")
+    for key in _as_keys(root_key):
+        window = normalize_path_text(text[start : start + 2 * len(key) + 16])
+        if not window.startswith(key):
+            continue
+        following = window[len(key) : len(key) + 1]
+        if not following or not (following.isalnum() or following in "_-."):
+            return True
+    return False
 
 
-def text_mentions_root(text: str, root_key: str) -> bool:
-    """True when any absolute path in ``text`` points inside ``root_key``."""
-    if not text or not root_key:
+def text_mentions_root(text: str, root_key: str | Sequence[str]) -> bool:
+    """True when any absolute path in ``text`` points inside the root."""
+    keys = _as_keys(root_key)
+    if not text or not keys:
         return False
-    if root_key not in normalize_path_text(text):
+    normalized = normalize_path_text(text)
+    keys = tuple(key for key in keys if key in normalized)
+    if not keys:
         return False
     return any(
-        path_starts_with_root(text, match.start(), root_key)
+        path_starts_with_root(text, match.start(), keys)
         for match in WINDOWS_PATH_RE.finditer(text)
-    ) or _posix_mentions_root(text, root_key)
+    ) or any(_posix_mentions_root(normalized, key) for key in keys)
 
 
-def _posix_mentions_root(text: str, root_key: str) -> bool:
+def _posix_mentions_root(normalized: str, root_key: str) -> bool:
     # Roots on macOS/Linux have no drive letter; a substring test is enough
     # once the folder boundary is checked.
     if ":" in root_key[:3]:
         return False
-    normalized = normalize_path_text(text)
     index = normalized.find(root_key)
     while index >= 0:
         following = normalized[index + len(root_key) : index + len(root_key) + 1]
@@ -400,7 +449,7 @@ def is_tooling_path(path: str) -> bool:
 
 def foreign_windows_paths(
     text: str,
-    root_key: str,
+    root_key: str | Sequence[str],
     ignore_tooling: bool = False,
 ) -> list[str]:
     """Absolute Windows paths in ``text`` that do not live under ``root_key``.
@@ -425,10 +474,12 @@ def foreign_windows_paths(
     return foreign
 
 
-def _truncated_prefix_of_root(text: str, match: re.Match[str], root_key: str) -> bool:
+def _truncated_prefix_of_root(
+    text: str, match: re.Match[str], root_key: str | Sequence[str]
+) -> bool:
     """``C:\\Users\\me\\Desktop\\vid…`` was cut by a length limit, not foreign."""
     end = match.end()
     if not text[end : end + 1] == "\u2026" and not match.group(0).endswith("\u2026"):
         return False
     stem = normalize_path_text(match.group(0).rstrip("\u2026"))
-    return len(stem) >= 4 and root_key.startswith(stem)
+    return len(stem) >= 4 and any(key.startswith(stem) for key in _as_keys(root_key))

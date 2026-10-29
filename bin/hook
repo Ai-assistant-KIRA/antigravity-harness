@@ -4,8 +4,8 @@
 # time (bin/python.path) when it still exists, then python3, then python.
 # HARNESS_PYTHON overrides all of them.
 set -u
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-HARNESS_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+HARNESS_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIR/.." && pwd)
 HARNESS_RUNNER="$HARNESS_ROOT/scripts/hook_runner.py"
 
 if [ -z "${HARNESS_PYTHON:-}" ] && [ -f "$SCRIPT_DIR/python.path" ]; then

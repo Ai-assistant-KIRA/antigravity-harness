@@ -38,7 +38,7 @@ from .util import (
     jaccard,
     normalize_for_compare,
     one_line,
-    path_root_key,
+    path_root_keys,
     read_text_lossless,
     truncate,
 )
@@ -1573,5 +1573,5 @@ class AgentsMdManager:
         """True when a rule cites an absolute path outside this workspace."""
         if not self.workspace_path:
             return False
-        root = path_root_key(self.workspace_path)
-        return bool(foreign_windows_paths(text or "", root, ignore_tooling=True))
+        roots = path_root_keys(self.workspace_path)
+        return bool(foreign_windows_paths(text or "", roots, ignore_tooling=True))
