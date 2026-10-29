@@ -77,7 +77,10 @@ function Install-Harness {
         # can push the final status line out of an agent's view.
         try {
             Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
-            Expand-Archive -Path $zip -DestinationPath $cleanup -Force
+            # Expand-Archive is a module function that ignores the caller's
+            # $ProgressPreference, so extract with .NET directly.
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            [IO.Compression.ZipFile]::ExtractToDirectory($zip, $cleanup)
         } finally { $ProgressPreference = $previousProgress }
         $found = Get-ChildItem -Path $cleanup -Filter 'install_plugin.py' -Recurse -Depth 2 | Select-Object -First 1
         if (-not $found) { throw "the downloaded archive does not contain install_plugin.py ($url)" }
