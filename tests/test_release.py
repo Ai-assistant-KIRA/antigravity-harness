@@ -86,6 +86,18 @@ class TestLauncherNewlines(unittest.TestCase):
         self.assertRegex(attributes, r"(?m)^\*\.cmd\s+text eol=crlf")
         self.assertRegex(attributes, r"(?m)^bin/hook\s+text eol=lf")
 
+    @unittest.skipIf(os.name == "nt", "POSIX file modes")
+    def test_installer_makes_both_posix_launchers_executable(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="harness-mode-") as temp:
+            target = Path(temp)
+            (target / "bin").mkdir()
+            for name in ("hook", "harness"):
+                (target / "bin" / name).write_text("#!/usr/bin/env sh\n", encoding="utf-8")
+                (target / "bin" / name).chmod(0o644)
+            install_plugin._ensure_launcher_permissions(target, dry_run=False)
+            for name in ("hook", "harness"):
+                self.assertTrue(os.access(target / "bin" / name, os.X_OK), name)
+
     def test_installer_repairs_launcher_line_endings(self) -> None:
         with tempfile.TemporaryDirectory(prefix="harness-eol-") as temp:
             target = Path(temp)

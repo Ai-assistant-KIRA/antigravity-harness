@@ -559,13 +559,14 @@ def _ensure_launcher_permissions(target: Path, dry_run: bool) -> None:
     """Keep the POSIX launcher executable even if the checkout mode was lost."""
     if dry_run or os.name == "nt":
         return
-    launcher = target / "bin" / "hook"
-    if not launcher.is_file():
-        return
-    try:
-        launcher.chmod(launcher.stat().st_mode | 0o111)
-    except OSError:
-        pass
+    # Both the hook launcher and the `harness` CLI wrapper are run directly.
+    for launcher in (target / "bin" / "hook", target / "bin" / "harness"):
+        if not launcher.is_file():
+            continue
+        try:
+            launcher.chmod(launcher.stat().st_mode | 0o111)
+        except OSError:
+            pass
 
 
 def _reset_data(target: Path, dry_run: bool) -> None:

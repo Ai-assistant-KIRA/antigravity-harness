@@ -26,7 +26,9 @@ generated skill, and rotate that credential.
 - Launchers get the line endings their shell needs, whatever the checkout
   produced, and `.gitattributes` pins them in the repository.
 - `bin/harness.cmd` and `bin/harness` use the recorded interpreter too, so the
-  CLI works on machines that only have the `py` launcher.
+  CLI works on machines that only have the `py` launcher. On macOS and Linux
+  the installer marks `bin/harness` executable as well as `bin/hook` (the CLI
+  wrapper failed with "Permission denied").
 - Running the installer with the checkout itself as the target explains how to
   fix it instead of only refusing.
 - `pyproject.toml`, `plugin.json`, and `harness.__version__` agree (the
@@ -40,7 +42,8 @@ generated skill, and rotate that credential.
   scope fix was skipped. Paths are now matched at their position in the raw
   text, JSON escapes such as `task:\n` are no longer read as drive letters, and
   tool or agent folders (Program Files, AppData, `~/.gemini`) do not count as
-  another project.
+  another project. On Windows, the 8.3 short spelling of a workspace
+  (`C:\Users\RUNNER~1\…`) and its long form both match.
 - **Credentials reached project files.** Redaction now covers
   `SetEnvironmentVariable("X_API_KEY", "…")`, `setx X_API_KEY …`, `--key …`,
   and `sk_…` keys. Generated skills, managed rules, and routing lines also pass
